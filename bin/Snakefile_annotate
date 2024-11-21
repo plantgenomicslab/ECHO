@@ -1,0 +1,2949 @@
+import yaml, sys, os, re, math, logging, json
+import pandas as pd
+from subprocess import check_output
+#from rich.logging import Console, RichHandler
+
+# Set up logging format
+#logging.basicConfig(level=logging.INFO,
+#		format="%(message)s",
+#		datefmt="[%X]",
+#		#force=True,
+#		handlers=[RichHandler(console=Console())])
+
+# Load config file
+config_file_path = 'config_annotate.yml'
+try:
+	with open(config_file_path, "r") as config_file:
+		config_dict = yaml.safe_load(config_file)
+except yaml.YAMLError as e:
+	logging.error("Could not load config file! Check config.yml ... see error below")
+	sys.exit(e)
+
+# Check config inputs
+for input in config_dict["Input"]:
+	if input == "prefix":
+		continue
+	elif input == "proteins":
+		#TODO: make sure protein and genome are absolute paths or linking for geta will break...
+		files = config_dict["Input"][input].split(",")
+		for file in files:
+			if not os.path.exists(file):
+				logging.error(f"Could not find {file}! Check Input/{input} in config.yaml ...")
+				sys.exit()
+	elif input == "liftoff":
+		input_value = config_dict["Input"][input]
+		if input_value is not None:
+			for dir in input_value:
+				if not os.path.exists(config_dict["Input"][input][dir]):
+					logging.error(f"Could not find {config_dict['Input'][input][dir]}! Check Input/{input}/{dir} in config.yml ...")
+					sys.exit()
+	elif input == "geta":
+		# TODO: Verify other geta configs
+		# NOTE: don't check pfamdb...should be installed in singularity
+		# Check config file for valid augustus set-up
+		if (config_dict["Input"][input]["augustus_species"] == "") & (config_dict["Input"][input]["use_augustus"] == ""):
+			logging.error(f"No value provided for augustus. Check config.yaml...")
+			sys.exit()
+		elif config_dict["Input"][input]["use_augustus"] != "":
+			#TODO: check augustus install for species, error and quit if not present use config_dict["Input"]["AUGUSTUS_CONFIG_PATH"]
+			#      Set a variable for use augustus
+			#      Set variable to hold agustus species
+			continue
+		elif config_dict["Input"][input]["augustus_species"] != "":
+			#TODO: Set augustus species variable
+			continue
+	elif input == "evm_weights":
+		if not os.path.exists(config_dict["Input"][input]) or not os.path.isabs(config_dict["Input"][input]):
+			logging.error(f"Could not find {config_dict['Input'][input]}, or the path is not absolute! Check Input/{input} in config.yml ...")
+			sys.exit()
+	elif input == "num_evm_files":
+		continue
+	elif input == "helixer_subseq":
+		continue
+	elif input == "helixer_model":
+		if config_dict["Input"][input] not in ["land_plant", "fungi", "vertebrate"]:
+			logging.error(f"Invalid value for {input}! Check Input/{input} in config.yml ...")
+			sys.exit()
+	elif not os.path.exists(config_dict["Input"][input]):
+		logging.error(f"Could not find {config_dict['Input'][input]}! Check Input/{input} in config.yml ...")
+		sys.exit()
+
+# Create working folders
+os.makedirs("logs/", exist_ok=True)
+os.makedirs("PASA/", exist_ok=True)
+os.makedirs("OTHER/STAR/", exist_ok=True)
+os.makedirs("OTHER/LiftOff/", exist_ok=True)
+os.makedirs("OTHER/PsiClass/", exist_ok=True)
+os.makedirs("OTHER/StringTie/", exist_ok=True)
+os.makedirs("AB_INITIO/Helixer/", exist_ok=True)
+os.makedirs("TRANSCRIPT/Gmap/", exist_ok=True)
+os.makedirs("TRANSCRIPT/HiSat/", exist_ok=True)
+os.makedirs("TRANSCRIPT/spades/", exist_ok=True)
+os.makedirs("TRANSCRIPT/evigene/", exist_ok=True)
+os.makedirs("TRANSCRIPT/PASA/", exist_ok=True)
+os.makedirs("PROTEIN/", exist_ok=True)
+os.makedirs("EVM/", exist_ok=True)
+os.makedirs("EVM/ok", exist_ok=True)
+os.makedirs("FILTER", exist_ok=True)
+os.makedirs("TMP", exist_ok=True)
+os.makedirs(f"GETA/RepeatMasker/repeatMasker/", exist_ok=True)
+os.makedirs(f"GETA/RepeatMasker/repeatModeler/", exist_ok=True)
+os.makedirs(f"GETA/fastp/paired/", exist_ok=True)
+os.makedirs(f"GETA/fastp/single/", exist_ok=True)
+os.makedirs(f"GETA/HiSat2/paired/", exist_ok=True)
+os.makedirs(f"GETA/HiSat2/single/", exist_ok=True)
+os.makedirs(f"GETA/transcript/", exist_ok=True)
+os.makedirs(f"GETA/homolog", exist_ok=True)
+os.makedirs(f"GETA/Augustus/config", exist_ok=True)
+os.makedirs(f"GETA/CombineGeneModels", exist_ok=True)
+if (config_dict["Input"]["geta"]["augustus_species"] != "placeholder") | (config_dict["Input"]["geta"]["augustus_species"] != ""):
+	os.makedirs(f"GETA/Augustus/training/", exist_ok=True)
+
+# Get inputs
+prefix = config_dict["Input"]["prefix"]
+genome = config_dict["Input"]["genome"]
+rna_seq = config_dict["Input"]["rna_seq"]
+helixer_model = config_dict["Input"]["helixer_model"]
+neighbor_gff = config_dict["Input"]["liftoff"]["neighbor_gff"]
+neighbor_fasta = config_dict["Input"]["liftoff"]["neighbor_fasta"]
+augustus_species = config_dict["Input"]["geta"]["augustus_species"]
+geta_RMspecies = config_dict["Input"]["geta"]["RM_species"]
+geta_pfamdb = config_dict["Input"]["geta"]["pfamdb"]
+image = config_dict["Input"]["singularity"]
+num_evm_files = config_dict["Input"]["num_evm_files"] #TODO: update script to accept arg 
+augustus_start_from = config_dict["Input"]["geta"]["augustus_start_from"]
+protein = config_dict["Input"]["proteins"]
+proteins = []
+prot_files = config_dict["Input"]["proteins"].split(",")
+for file in prot_files:
+	os.system(f"ln -sf {file} PROTEIN/")
+	file = re.sub(r"^.*\/", "", file)
+	proteins.append("PROTEIN/" + file)
+if augustus_start_from == "placeholder":
+	augustus_start_from = ""
+temp_folder = "./TMP" 
+
+# Set up Augustus configs
+# $AUGUSTUS_CONFIG_PATH set relative to cwd in singularity...
+if not os.path.exists("GETA/Augustus/config"):
+	os.makedirs("GETA/Augustus/config/species")
+	os.system(f"singularity exec {image} cp -r /opt/miniconda3/config/extrinsic /opt/miniconda3/config/model /opt/miniconda3/config/profile GETA/Augustus/config")
+
+if config_dict["Input"]["geta"]["geta_conf"] == "big":
+	geta_conf = "/usr/local/bin/geta/conf_for_big_genome.txt"
+else:
+	geta_conf = "/usr/local/bin/geta/conf_for_small_genome.txt"
+
+bams = []
+pair1_re = re.compile(".*_1.fastq.gz$")
+pair2_re = re.compile(".*_2.fastq.gz$")
+se_re = re.compile(".*.fastq.gz$")
+for root, dirs, files in os.walk(rna_seq):
+	for fi in files:
+		fi = fi.strip()
+		basename = re.search(r'([A-Za-z0-9\-\.]+)(_[12]){0,1}\.fastq.gz', fi)
+		if pair1_re.match(fi):
+			os.system(f"ln -sf {os.path.join(root,fi)} {os.path.join('GETA/fastp/paired/',fi)}")
+			bams.append(f"GETA/HiSat2/paired/hisat2.{basename.group(1)}.bam")
+		elif pair2_re.match(fi):
+			os.system(f"ln -sf {os.path.join(root,fi)} {os.path.join('GETA/fastp/paired/',fi)}")
+		elif se_re.match(fi):
+			os.system(f"ln -sf {os.path.join(root,fi)} {os.path.join('GETA/fastp/single/',fi)}")
+			bams.append(f"GETA/HiSat2/single/hisat2.{basename.group(1)}.bam")
+	break
+
+if not os.path.exists("GETA/genome.fasta"):
+	os.system(f"ln -sf {genome} GETA/genome.fasta")
+
+def allInput(wildcards):
+	input = [f"AB_INITIO/Helixer/{prefix}_helixer.gff3",
+		"OTHER/LiftOff/combined.fasta",
+		"OTHER/LiftOff/combined.gff3",
+		f"OTHER/LiftOff/{prefix}_liftoff.gff3",
+		"TRANSCRIPT/Gmap/liftoffExon.fasta",
+		"TRANSCRIPT/Gmap/DB/DB.chromosome",
+		"TRANSCRIPT/Gmap/gmapExon.gff3",
+		"TRANSCRIPT/HiSat/hisat2.sorted.rmdup.fasta",
+		"TRANSCRIPT/spades/hard_filtered_transcripts.fasta",
+		"TRANSCRIPT/spades/okayset/spades.okay.tr",
+		"TRANSCRIPT/spades/okayset/spades.okay.tr.clean",
+		"TRANSCRIPT/PASA/pasa.sqlite.pasa_assemblies.gff3",
+		"TRANSCRIPT/HiSat/hisat2.sorted.rmdup.XS.bam",
+		"OTHER/StringTie/stringtie.hisat2.gff",
+		"TRANSCRIPT/HiSat/hisat2.sorted.rmdup_R1.fastq.gz",
+		"TRANSCRIPT/HiSat/hisat2.sorted.rmdup_R2.fastq.gz",
+		"OTHER/STAR/SAindex",
+		"OTHER/STAR/hisat2.sorted.rmdup.STAR_pairedend.bamAligned.sortedByCoord.out.bam",
+		"OTHER/STAR/hisat2.sorted.rmdup.STAR_singleend.bamAligned.sortedByCoord.out.bam",
+		"OTHER/STAR/hisat2.sorted.rmdup.STAR_merge_XS.bam",
+		"OTHER/PsiClass/psiclass.STAR_vote.gff",
+		"OTHER/StringTie/stringtie.STAR.gff",
+		"EVM/genewise_protAln_evm.gff",
+		"EVM/gmap_exonAln_evm.gff",
+		#"EVM/gene_predictions_checkCoords.gff3",
+		#"EVM/transcript_alignments_checkCoords.gff3",
+		"EVM.all.gff3",
+		"pasaPost.ok",
+		"GETA/RepeatMasker/repeatMasker/genome.fasta.out",
+		"GETA/RepeatMasker/repeatModeler/genome.fasta.out",
+		"GETA/RepeatMasker/genome.masked.fasta",
+		"GETA/HiSat2/hisat2.sorted.bam",
+		"GETA/HiSat2/genome.1.ht2",
+		"GETA/transcript/splited_sam_files.list",
+		f"GETA/{config_dict['Input']['prefix']}.geneModels.gff3",
+		"PROTEIN/merged_rmdup_proteins.fasta.miniprot.gff3",
+		"EVM/miniprot_proteinAln_evm.gff",
+		"mikado/mikado.loci.gff3",
+		"complete_draft.gff3",
+		"GETA/homolog/genewise.gff",
+		"GETA/homolog/homolog_protein.split/homolog.part_001.out"
+		]
+
+	if config_dict["Input"]["geta"]["RM_lib"] == "None":
+		input.append(f"GETA/RepeatMasker/repeatModeler/species-families.fa")
+		input.append(f"GETA/RepeatMasker/repeatModeler/species-families.stk")
+	
+#	for evm_num in range(num_evm_files):
+#	    input.append(f"EVM/commands.{str(evm_num).zfill(width)}.list")
+#	    input.append(f"EVM/ok/commands.{str(evm_num).zfill(width)}.ok")
+#	return input
+	
+	for evm_num in range(num_evm_files):
+		input.append(f"EVM/commands.{evm_num}.list")
+		input.append(f"EVM/ok/commands.{evm_num}.ok")
+	return(input)
+
+rule all:
+	input:	allInput
+
+#localrules: all, prepare_liftoff, transfragComplete, mergeMMseqs
+
+#TODO: add the ability to provide external pre-run output files for many of the EVM inputs
+
+############# Begin GETA Snakemake ###############
+rule RepeatMasker_species:
+	output: "GETA/RepeatMasker/repeatMasker/genome.fasta.out"
+	threads: config_dict["RepeatMasker_species"]["threads"]
+	params:
+		args = config_dict["Internal"]["RepeatMasker"],
+		species = geta_RMspecies
+	singularity: image
+	shell:"""
+		RepeatMasker {params.args} \
+			-pa {threads} \
+			-species {params.species} \
+			-dir GETA/RepeatMasker/repeatMasker/ \
+			GETA/genome.fasta
+		"""
+
+rule RepeatModeler:
+	output: 
+		"GETA/RepeatMasker/repeatModeler/species-families.fa",
+		"GETA/RepeatMasker/repeatModeler/species-families.stk"
+	threads: config_dict["RepeatModeler"]["threads"]
+	params: g = genome
+	singularity: image
+	shell:"""
+		if [ ! -e  GETA/RepeatMasker/repeatModeler/BuildDatabase.ok ]; then
+		  BuildDatabase -name GETA/RepeatMasker/repeatModeler/species -engine ncbi GETA/genome.fasta
+		  touch BuildDatabase.ok
+		fi
+
+		RepeatModeler \
+		-pa {threads} \
+		-database GETA/RepeatMasker/repeatModeler/species \
+		-LTRStruct
+		"""
+
+# Variable input required for RepeatMasker_custom based on value of 'RM_lib'
+def repeatMaskerCustom_input(wildcards):
+	if (config_dict["Input"]["geta"]["RM_lib"] == "") | (config_dict["Input"]["geta"]["RM_lib"] == "placeholder"):
+		input = f"GETA/RepeatMasker/repeatModeler/species-families.fa"
+	else: 
+		input = config_dict["Input"]["geta"]["RM_lib"]
+	return(input)
+
+rule RepeatMasker_custom:
+	input: repeatMaskerCustom_input
+	output: "GETA/RepeatMasker/repeatModeler/genome.fasta.out"
+	threads: config_dict["RepeatMasker_custom"]["threads"]
+	params: args = config_dict["Internal"]["RepeatMasker"]
+	singularity: image
+	shell:"""
+		RepeatMasker {params.args} \
+			-pa {threads} \
+			-lib {input} \
+			-dir GETA/RepeatMasker/repeatModeler \
+			GETA/genome.fasta
+		"""
+
+rule RepeatMasker_merge:
+	input:
+		repeatmasker = "GETA/RepeatMasker/repeatMasker/genome.fasta.out",
+		repeatmodeler = "GETA/RepeatMasker/repeatModeler/genome.fasta.out"
+	output: 
+		"GETA/RepeatMasker/genome.masked.fasta",
+		"GETA/RepeatMasker/genome.repeat.gff3"
+	threads: config_dict["RepeatMasker_merge"]["threads"]
+	singularity: image
+	shell:"""
+		merge_repeatMasker_out.pl \
+			GETA/genome.fasta \
+			{input.repeatmasker} \
+			{input.repeatmodeler} \
+			> GETA/RepeatMasker/genome.repeat.stats
+
+		mv genome.repeat.gff3 GETA/RepeatMasker/genome.repeat.gff3
+		mv genome.repeat.out GETA/RepeatMasker/genome.repeat.out
+		
+		maskedByGff.pl \
+			GETA/RepeatMasker/genome.repeat.gff3 \
+			GETA/genome.fasta \
+			> GETA/RepeatMasker/genome.masked.fasta
+		"""
+
+rule fastp_PAIRED:
+	input: 
+		fwd = "GETA/fastp/paired/{run}_1.fastq.gz",
+		rev = "GETA/fastp/paired/{run}_2.fastq.gz"
+	output: 
+		fwd = "GETA/fastp/paired/{run}_1.fq.gz",
+		rev = "GETA/fastp/paired/{run}_2.fq.gz"
+	singularity: image
+	threads: config_dict["fastp_PAIRED"]["threads"]
+	shell:"""
+		fastp --detect_adapter_for_pe \
+			--overrepresentation_analysis \
+			--cut_right \
+			--thread {threads} \
+			--json GETA/fastp/paired/{wildcards.run}.fastp.json \
+			-i {input.fwd} -I  {input.rev} \
+			-o {output.fwd} -O {output.rev}
+		"""
+
+rule fastp_SINGLE:
+	input: "GETA/fastp/single/{run}.fastq.gz"
+	output: "GETA/fastp/single/{run}.fq.gz"
+	singularity: image
+	threads: config_dict["fastp_SINGLE"]["threads"]
+	shell:"""
+		fastp --overrepresentation_analysis \
+			--cut_right \
+			--thread {threads} \
+			--json GETA/fastp/single/{wildcards.run}.fastp.json \
+			-i {input} \
+			-o {output}
+		"""
+
+rule HiSat2_build:
+	input: "GETA/RepeatMasker/genome.masked.fasta"
+	output: "GETA/HiSat2/genome.1.ht2"
+	params: args = config_dict["Internal"]["hisat2-build"]
+	singularity: image
+	shell: "hisat2-build {params.args} {input} GETA/HiSat2/genome"
+
+rule HiSat2_PAIRED:
+	input: 
+		built = "GETA/HiSat2/genome.1.ht2",
+		fwd = "GETA/fastp/paired/{run}_1.fq.gz",
+		rev = "GETA/fastp/paired/{run}_2.fq.gz"
+	output: "GETA/HiSat2/paired/hisat2.{run}.bam"
+	params: 
+		args = config_dict["Internal"]["hisat2"],
+		threads_full = config_dict["HiSat2_PAIRED"]["threads"],
+		threads_half = config_dict["HiSat2_PAIRED"]["threads"] // 2
+	singularity: image
+	shell:"""
+		hisat2 -x GETA/HiSat2/genome \
+			-p {params.threads_full} \
+			-1 {input.fwd} -2 {input.rev} \
+			{params.args} | samtools sort -O BAM -o GETA/HiSat2/paired/hisat2.{wildcards.run}.sort.bam
+			
+		sambamba markdup \
+		  --nthreads={params.threads_half} \
+		  --remove-duplicates \
+		  GETA/HiSat2/paired/hisat2.{wildcards.run}.sort.bam \
+		  {output} \
+		  --tmpdir=TRANSCRIPT/HiSat/sambamba_tmp/{wildcards.run}
+		
+		rm -rf TRANSCRIPT/HiSat/sambamba_tmp/{wildcards.run}
+		rm GETA/HiSat2/paired/hisat2.{wildcards.run}.sort.bam
+
+		touch {output}
+		"""
+
+rule HiSat2_SINGLE:
+	input: 
+		built = "GETA/HiSat2/genome.1.ht2",
+		se = "GETA/fastp/single/{run}.fq.gz"
+	output: "GETA/HiSat2/single/hisat2.{run}.bam"
+	params: 
+		args = config_dict["Internal"]["hisat2"],
+		threads_full = config_dict["HiSat2_SINGLE"]["threads"],
+		threads_half = config_dict["HiSat2_SINGLE"]["threads"] // 2
+	singularity: image
+	shell:"""
+		hisat2 -x GETA/HiSat2/genome \
+			-p {params.threads_full} \
+			-U {input.se} \
+			{params.args} | samtools sort -O BAM -o GETA/HiSat2/single/hisat2.{wildcards.run}.sort.bam
+			
+		sambamba markdup \
+		  --nthreads={params.threads_half} \
+		  --remove-duplicates \
+		  GETA/HiSat2/single/hisat2.{wildcards.run}.sort.bam \
+		  {output} \
+		  --tmpdir=TRANSCRIPT/HiSat/sambamba_tmp/{wildcards.run}
+		
+		rm -rf TRANSCRIPT/HiSat/sambamba_tmp/{wildcards.run}
+		rm GETA/HiSat2/single/hisat2.{wildcards.run}.sort.bam
+
+		touch {output}
+		"""
+
+rule mergeHiSat:
+	input: bams
+	output: "GETA/HiSat2/hisat2.sorted.bam"
+	params: 
+		threads_full = config_dict["mergeHiSat"]["threads"],
+		threads_half = config_dict["mergeHiSat"]["threads"] // 2,
+		threads_quarter = config_dict["mergeHiSat"]["threads"] // 4,
+		sort_mem = config_dict["mergeHiSat"]["sortmem"],
+		sort_threads = config_dict["mergeHiSat"]["sortthreads"],
+		singularity = image
+	shell:'''
+		# These commands get long and singularity has an OS defined command length limit
+		echo "samtools merge -f --threads {params.threads_full} GETA/HiSat2/hisat2.merge.bam {input}" | \
+		singularity exec {params.singularity} bash -c "read -u 0 line; set -- \$line; exec \"\$@\""
+		
+		singularity exec {params.singularity} \
+		sambamba sort -p \
+		  --memory-limit={params.sort_mem} \
+		  --tmpdir=TRANSCRIPT/HiSat/sambamba_tmp/merge \
+		  --nthreads={params.sort_threads} \
+		  GETA/HiSat2/hisat2.merge.bam \
+		  -o GETA/HiSat2/hisat2.sort.bam
+
+		rm GETA/HiSat2/hisat2.merge.bam
+
+		singularity exec {params.singularity} \
+		sambamba markdup \
+		  --nthreads={params.threads_quarter} \
+		  --remove-duplicates \
+		  GETA/HiSat2/hisat2.sort.bam \
+		  GETA/HiSat2/hisat2.rmdup.bam \
+		  --tmpdir=TRANSCRIPT/HiSat/sambamba_tmp/merge
+
+		rm GETA/HiSat2/hisat2.sort.bam
+
+		singularity exec {params.singularity} \
+		samtools sort \
+		  -@ {params.threads_quarter} \
+		  -O BAM \
+		  -o {output} \
+		  GETA/HiSat2/hisat2.rmdup.bam
+		
+		rm GETA/HiSat2/hisat2.rmdup.bam
+		rm -rf TRANSCRIPT/HiSat/sambamba_tmp
+		'''
+
+checkpoint HiSat2_split:
+	input: "GETA/HiSat2/hisat2.sorted.bam"
+	output: 
+		"GETA/transcript/splited_sam_files.list",
+		directory("GETA/transcript/splited_sam_out")
+	singularity: image
+	threads: config_dict["HiSat2_split"]["threads"]
+	shell:"""
+		samtools view \
+		  -h GETA/HiSat2/hisat2.sorted.bam \
+		  > GETA/HiSat2/hisat2.sorted.sam
+
+		split_sam_from_non_aligned_region \
+		  GETA/HiSat2/hisat2.sorted.sam \
+		  GETA/transcript/splited_sam_out 10 \
+		  > GETA/transcript/splited_sam_files.list
+		
+		rm GETA/HiSat2/hisat2.sorted.sam
+		"""
+
+# TODO: re-evaluation of the dag here takes forever... too many files
+def getSplitedSam(wildcards):
+	ck_output = checkpoints.HiSat2_split.get(**wildcards).output[1]
+	SMP, = glob_wildcards(os.path.join(ck_output, "{splited}.sam"))
+	inputs = expand(os.path.join(ck_output, "{splited}.gtf"), splited=SMP)
+	return inputs
+
+# TODO: split GETA/transcript/splited_sam_files.list into many files to submit as clustered job
+#       this will require Sam2Transfrag to be modified with a for loop, but should limit overhead
+rule Sam2Transfrag:
+	input: "GETA/transcript/splited_sam_out/{splited}.sam"
+	output: "GETA/transcript/splited_sam_out/{splited}.gtf"
+	params: args = config_dict["Internal"]["sam2transfrag"]
+	singularity: image
+	shell:
+		"""
+		sam2transfrag \
+			--no_strand_specific \
+			{params.args} \
+			--intron_info_out GETA/transcript/splited_sam_out/{wildcards.splited}.intron \
+			--base_depth_out GETA/transcript/splited_sam_out/{wildcards.splited}.base_depth \
+			{input} > {output}
+		"""
+
+rule mergeTransfrag:
+	input: getSplitedSam
+	output: 
+		"GETA/transcript/transfrag.gtf",
+		"GETA/transcript/intron.txt",
+		"GETA/transcript/base_depth.txt",
+		"GETA/transcript/transfrag.strand.fasta"
+	params: 
+		g = genome,
+		singularity = image
+	run:
+		shell("if test -f GETA/transcript/transfrag.list; then rm GETA/transcript/transfrag.list;fi")
+		shell("if test -f GETA/transcript/intron.txt; then rm GETA/transcript/intron.txt;fi")
+		shell("if test -f GETA/transcript/base_depth.txt; then rm GETA/transcript/base_depth.txt;fi")
+		for item in input:
+			item = re.sub(r"\.[a-zA-Z]+$", "", item)
+			shell(f"cat {item}.gtf >> GETA/transcript/transfrag.gtf")
+			shell(f"cat {item}.intron >> GETA/transcript/intron.txt")
+			shell(f"cat {item}.base_depth >> GETA/transcript/base_depth.txt")
+
+		shell("singularity exec {params.singularity} \
+			transfragDump \
+			--out GETA/transcript/transfrag \
+			GETA/transcript/transfrag.gtf \
+			{params.g}")
+
+#TODO: add threads?
+rule transDecoder_LongOrfs:
+	input: "GETA/transcript/transfrag.strand.fasta"
+	output: "GETA/transcript/longest_orfs.cds"
+	params: args = config_dict["Internal"]["TransDecoder.LongOrfs"]
+	singularity: image
+	shell:"""
+		if [ -d GETA/transcript.__checkpoints_longorfs ]; then
+		  if [ -z "$(ls -A GETA/transcript.__checkpoints_longorfs)" ]; then 
+		    echo "No checkpoints...continuing"; 
+		  else 
+		    rm GETA/transcript.__checkpoints_longorfs/*;
+		  fi
+			fi
+
+		TransDecoder.LongOrfs {params.args} \
+		  -t {input} -S \
+		  --output_dir GETA/transcript	 
+		"""
+
+rule transDecoder_Predict:
+	input: "GETA/transcript/longest_orfs.cds"
+	output: "GETA/transcript/transfrag.transdecoder.gff3"
+	params: args = config_dict["Internal"]["TransDecoder.Predict"]
+	singularity: image
+	shell:
+		"""
+		if [ -d GETA/transcript.__checkpoints ]; then
+		  if [ -z "$(ls -A GETA/transcript.__checkpoints)" ]; then
+		    echo "No checkpoints...continuing";
+		  else
+		    rm GETA/transcript.__checkpoints/*;
+		  fi
+		fi
+
+		TransDecoder.Predict {params.args} \
+		  -t GETA/transcript/transfrag.strand.fasta \
+		  --output_dir GETA/transcript
+
+		mv transfrag.strand.fasta.transdecoder* GETA/transcript/
+		mv GETA/transcript/transfrag.strand.fasta.transdecoder.gff3 GETA/transcript/transfrag.transdecoder.gff3
+		"""
+
+#TODO: Add "nostrand"?
+
+rule transdecoder2ORF:
+	input: "GETA/transcript/transfrag.transdecoder.gff3"
+	output: "GETA/transcript/transdecoder2ORF.gff3"
+	singularity: image
+	shell: 
+		"""
+		transdecoder2ORF \
+			--out_protein GETA/transcript/proteins.fasta \
+			GETA/transcript/transfrag.gtf \
+			{input} GETA/genome.fasta > GETA/transcript/transdecoder2ORF.gff3
+		"""
+
+rule GFF3Clear:
+	input: "GETA/transcript/transdecoder2ORF.gff3" 
+	output: "GETA/transcript/transfrag.genome.gff3"
+	singularity: image
+	shell: 
+		"""
+		GFF3Clear \
+			--GFF3_source GETA \
+			--genome GETA/genome.fasta \
+			--gene_prefix transfrag \
+			--no_attr_add {input} > {output}
+		"""
+
+# These next three rules are not currently run during the workflow...
+rule transfragComplete:
+	input: "GETA/transcript/transfrag.genome.gff3"
+	output: "GETA/transcript/transfrag.genome.complete.gff3"
+	run:
+		# TODO: Check that this perl translation works
+		with open(input, "r") as infile:
+			with open(output, "w") as outfile:
+				for line in infile:
+					if re.search(r"\tgene\t", line):
+						if re.search(r"Form=one_transcript_get_1_gene_model.*Integrity=complete"):
+							outfile.write(line)
+
+rule ORF2bestGeneModels:
+	input: "GETA/transcript/transfrag.genome.complete.gff3"
+	output: "GETA/transcript/best_candidates.gff3"
+	params: args = config_dict["Internal"]["ORF2bestGeneModels"]
+	singularity: image
+	shell:
+		"""
+		ORF2bestGeneModels {params.args} \
+			{input} > {output} 
+		"""
+
+rule bestGeneModels2lowIdentity:
+	input: "GETA/transcript/best_candidates.gff3 "
+	output:"GETA/transcript/best_candidates.lowIdentity.gff3"
+	threads: config_dict["bestGeneModels2lowIdentity"]["threads"]
+	singularity: image
+	shell:
+		"""
+		bestGeneModels2lowIdentity \
+			{input} \
+			GETA/transcript/proteins.fasta \
+			{threads} \
+			0.8 > {output}
+		"""
+
+
+def readFasta(path:str, sep=" " ,index=0) -> dict:
+	seq = {}
+	id = None
+	lines = []
+	
+	with open(path, 'r') as file:	
+		while True:
+			line = file.readline()
+			if not line:
+				break
+
+			line = line.strip()
+			if line.startswith('>'):
+				if lines:
+					seq[id] = "".join(lines)
+				id = line[1:]
+				try:
+					id = id.split(sep)[index]
+				except:
+					id = id.split(" ")[0]
+				lines = []
+			else:
+				lines.append(line)
+	
+	if id and lines:
+			seq[id] = "".join(lines)
+
+	return seq
+
+def get_partition(length, ss, os):
+	out = []
+	pos = 1
+	out.append(pos)
+
+	while (pos + ss - 1) < length:
+		pos = pos + ss - 1 - os + 1
+		out.append(pos)
+
+	return out
+
+
+parts = []
+for i in range(20):
+	n = str(int(i)+1).zfill(3)
+	parts.append(f"part_{n}")
+
+rule mergeProteins:
+	input: proteins
+	output: 
+		m = "PROTEIN/merged_rmdup_proteins.fasta",
+		g = "GETA/homolog.fasta"
+	singularity: image
+	threads: config_dict["mergeProteins"]["threads"]
+	shell:"""
+		seqkit rmdup -j {threads} -s < <(cat {input}) > {output.m}
+		ln -sf $(readlink -f {output.m}) GETA/homolog.fasta
+		"""
+
+rule miniprot:
+	input: rules.mergeProteins.output.m
+	output: 
+		gff = "PROTEIN/merged_rmdup_proteins.fasta.miniprot.gff3",
+		clean ="PROTEIN/merged_rmdup_proteins.fasta.miniprot.clean.gff3"
+	threads: config_dict["miniprot"]["threads"]
+	singularity: image
+	params: genome = config_dict["Input"]["genome"]
+	shell:
+		"""
+		miniprot -t{threads} --outs=0.97 -Iut16 {params.genome} {input} --gff > {output.gff}
+		grep -v "#" {output.gff} > {output.clean}
+		"""
+
+checkpoint miniprot2genewise:
+	input: 
+		m = rules.miniprot.output.clean,
+		p = rules.mergeProteins.output.m,
+	output: directory("GETA/homolog/geneRegion_genewise.tmp/")
+	params: g = genome
+	shell: "python bin/miniprot2Genewise.py {params.g} {input.p} {input.m}"
+
+# Genewise fails on sequences like Sevir.9G432000.2.v2.1 (Glycine rich cell wall structural proteins)
+rule geneRegion2Genewise:
+	input: prot = "GETA/homolog/geneRegion_genewise.tmp/{seqid}.faa"
+	output: "GETA/homolog/geneRegion_genewise.tmp/{seqid}.gff"
+	params: singularity = image
+	run:
+		faa = readFasta(input.prot)
+		fna_file = re.sub(r"\.faa", ".fna", input.prot)
+		fna = readFasta(fna_file)
+
+		if os.path.exists(output[0]):
+			os.remove(output[0])
+
+		for aa_seq in faa.keys():
+			nt_seq = re.sub(r"\!.*", "", aa_seq)
+			with open(f"GETA/homolog/geneRegion_genewise.tmp/temp_{wildcards.seqid}.aa", 'w') as out:
+				out.write(f">{aa_seq}\n{faa[aa_seq]}\n")
+			with open(f"GETA/homolog/geneRegion_genewise.tmp/temp_{wildcards.seqid}.na", 'w') as out:
+				out.write(f">{nt_seq}\n{fna[nt_seq]}\n")
+
+			try:
+				if re.search(r"plus", aa_seq):
+					shell(f"singularity exec {params.singularity} genewise \
+					GETA/homolog/geneRegion_genewise.tmp/temp_{wildcards.seqid}.aa \
+					GETA/homolog/geneRegion_genewise.tmp/temp_{wildcards.seqid}.na \
+					-tfor -gff -quiet -silent -sum >> {output}")
+
+				else:
+					shell(f"singularity exec {params.singularity} genewise \
+					GETA/homolog/geneRegion_genewise.tmp/temp_{wildcards.seqid}.aa \
+					GETA/homolog/geneRegion_genewise.tmp/temp_{wildcards.seqid}.na \
+					-trev -gff -quiet -silent -sum >> {output}")
+			except:
+				with open(input.prot, 'r') as prot:
+					prot_line = prot.readline()
+				with open("GETA/homolog/genewise_failed_commands.txt", 'a') as failed:
+					failed.write(f"{prot_line}\n")
+
+		os.remove(f"GETA/homolog/geneRegion_genewise.tmp/temp_{wildcards.seqid}.aa")
+		os.remove(f"GETA/homolog/geneRegion_genewise.tmp/temp_{wildcards.seqid}.na")
+		
+
+def get_miniprot2genewise(wildcards):
+	ck_output = checkpoints.miniprot2genewise.get(**wildcards).output[0]
+	SMP, = glob_wildcards(os.path.join(ck_output, "{seqid}.faa"))
+	inputs = expand(os.path.join(ck_output, "{seqid}.gff"), seqid=SMP)
+	return inputs
+
+rule merge_geneRegion2Genewise:
+	input: get_miniprot2genewise
+	output:
+		gff = "GETA/homolog/genewise.gff",
+		info = "GETA/homolog/genewise.start_info.txt"
+	params: g = genome
+	run:
+		try:
+			os.remove("GETA/homolog/genewise.start_info.txt")
+		except OSError:
+			pass
+		try:
+			os.remove("GETA/homolog/genewise.gff")
+		except OSError:
+			pass
+		
+		# Process genewise results
+		for f in input:
+			with open(f, 'r') as infile:
+				content = infile.read()
+				try:
+					content = content.split('//\n')
+				except:
+					print(f"Error parsing {f}", file=sys.stderr)
+					continue
+				for block in content:
+					if block.startswith("Bits"):
+						align_line = block.split('\n')[1]
+						parts = align_line.split()
+						seq = parts[4].split('.')[0]
+						start = parts[4].split('.')[1]
+						locus = int(parts[5]) + int(start)
+						ID = parts[1]
+						if int(parts[2]) == 1:
+							with open(output.info, 'a') as info:
+								info.write(f"{seq}\t{locus}\t{parts[0]}\n")
+
+					else:
+						gff_lines = block.split('\n')
+						for gff_line in gff_lines:
+							if gff_line:
+								parts = gff_line.split('\t')
+								s = int(parts[3]) + int(start)
+								e = int(parts[4]) + int(start)
+								#ID = parts[8].split('-')[0]
+								with open(output.gff, 'a') as gff:
+									gff.write(f"{seq}\t{parts[1]}\t{parts[2]}\t{s}\t{e}\t{parts[5]}\t{parts[6]}\t{parts[7]}\tID={ID};Name={ID};\n")
+
+rule genewiseGFF2GFF3:
+	input: 
+		gff = "GETA/homolog/genewise.gff",
+		info = "GETA/homolog/genewise.start_info.txt"
+	output:
+		hints = "GETA/homolog/genewise.start_stop_hints.gff",
+		gff = "GETA/homolog/genewise.gff3",
+		er = "GETA/homolog/genewise.gene_id_with_stop_codon.txt"
+	params: 
+		args = config_dict['Internal']['homolog_genewiseGFF2GFF3'],
+		genome = genome,
+	singularity: image
+	shell:
+		"""
+		homolog_genewiseGFF2GFF3 {params.args} \
+			--input_genewise_start_info {input.info} \
+			--output_start_and_stop_hints_of_augustus {output.hints} \
+			--genome {params.genome} \
+			{input.gff} > {output.gff} 2> {output.er}
+
+		GFF3Clear \
+			--GFF3_source GETA \
+			--genome {params.genome} \
+			--gene_prefix genewise \
+			--no_attr_add {output.gff} > GETA/homolog/out.gff3 2> /dev/null
+		
+		mv GETA/homolog/out.gff3 {output.gff}
+		"""
+
+# Step 5. Augustus 
+
+#TODO: add setup for using pre-trained agustus models
+
+checkpoint prepCombineGeneModels:
+	input:
+		transfrag = "GETA/transcript/transfrag.genome.gff3",
+		genewise = "GETA/homolog/genewise.gff3"
+	output:
+		directory("GETA/Augustus/training/combineGeneModels_tmp")
+	run:
+		file = open("GETA/Augustus/training/blank.augustus.gff3", "w")
+		file.close()
+		file = open("GETA/Augustus/training/blank.intron.gff", "w")
+		file.close()
+	
+		chr = {}
+		augustus = {}
+		intron = {}
+
+		transfrag = {}
+		with open(input.transfrag, 'r') as IN:
+			for line in IN:
+				if line.startswith("#") or line.strip() == "":
+					continue
+				fields = line.split("\t")
+				chr[fields[0]] = 1
+				if fields[0] not in transfrag:
+					transfrag[fields[0]] = {fields[6]:line}
+				elif fields[6] not in transfrag[fields[0]]:
+					transfrag[fields[0]][fields[6]] = line
+				else:
+					transfrag[fields[0]][fields[6]] += "\n" + line
+
+		genewise = {}
+		with open(input.genewise, 'r') as IN:
+			for line in IN:
+				if line.startswith("#") or line.strip() == "":
+					continue
+				fields = line.split("\t")
+				chr[fields[0]] = 1
+				if fields[0] not in genewise:
+					genewise[fields[0]] = {fields[6]:line}
+				elif fields[6] not in genewise[fields[0]]:
+					genewise[fields[0]][fields[6]] = line
+				else:
+					genewise[fields[0]][fields[6]] += "\n" + line
+
+		tmp = "GETA/Augustus/training/combineGeneModels_tmp"
+		if not os.path.exists(tmp):
+			os.mkdir(tmp)
+
+		out_name = []
+		for chr_key in sorted(chr.keys()):
+			with open(f"{tmp}/{chr_key}_plus_augustus.gff3", 'w') as OUT:
+				try: 
+					OUT.write(augustus[chr_key]["+"])
+				except:
+					pass
+
+			with open(f"{tmp}/{chr_key}_minus_augustus.gff3", 'w') as OUT:
+				try:
+					OUT.write(augustus[chr_key]["-"])
+				except:
+					pass
+
+			with open(f"{tmp}/{chr_key}_plus_transfrag.gff3", 'w') as OUT:
+				try:
+					OUT.write(transfrag[chr_key]["+"])
+				except:
+					pass
+
+			with open(f"{tmp}/{chr_key}_minus_transfrag.gff3", 'w') as OUT:
+				try:
+					OUT.write(transfrag[chr_key]["-"])
+				except:
+					pass
+
+			with open(f"{tmp}/{chr_key}_plus_genewise.gff3", 'w') as OUT:
+				try:
+					OUT.write(genewise[chr_key]["+"])
+				except:
+					pass
+
+			with open(f"{tmp}/{chr_key}_minus_genewise.gff3", 'w') as OUT:
+				try:
+					OUT.write(genewise[chr_key]["-"])
+				except:
+					pass
+
+			with open(f"{tmp}/{chr_key}_plus_intron.gff", 'w') as OUT:
+				try:
+					OUT.write(intron[chr_key]["+"])
+				except:
+					pass
+
+			with open(f"{tmp}/{chr_key}_minus_intron.gff", 'w') as OUT:
+				try:
+					OUT.write(intron[chr_key]["-"])
+				except:
+					pass
+
+rule combineGeneModelsPlus:
+	input: 
+		a = "GETA/Augustus/training/combineGeneModels_tmp/{chr}_plus_augustus.gff3",
+		t = "GETA/Augustus/training/combineGeneModels_tmp/{chr}_plus_transfrag.gff3",
+		g = "GETA/Augustus/training/combineGeneModels_tmp/{chr}_plus_genewise.gff3",
+		i = "GETA/Augustus/training/combineGeneModels_tmp/{chr}_plus_intron.gff"
+	output:
+		one = "GETA/Augustus/training/combineGeneModels_tmp/{chr}_plus.1.gff3",
+		two = "GETA/Augustus/training/combineGeneModels_tmp/{chr}_plus.2.gff3"
+	params: args = config_dict["Internal"]["paraCombineGeneModels"]
+	singularity: image
+	shell:"""
+		combineGeneModels \
+		{params.args} \
+		{input.a} \
+		{input.t} \
+		{input.g} \
+		{input.i} \
+		> {output.one} \
+		2> {output.two}
+		"""
+
+rule combineGeneModelsMinus:
+	input: 
+		a = "GETA/Augustus/training/combineGeneModels_tmp/{chr}_minus_augustus.gff3",
+		t = "GETA/Augustus/training/combineGeneModels_tmp/{chr}_minus_transfrag.gff3",
+		g = "GETA/Augustus/training/combineGeneModels_tmp/{chr}_minus_genewise.gff3",
+		i = "GETA/Augustus/training/combineGeneModels_tmp/{chr}_minus_intron.gff"
+	output:
+		one = "GETA/Augustus/training/combineGeneModels_tmp/{chr}_minus.1.gff3",
+		two = "GETA/Augustus/training/combineGeneModels_tmp/{chr}_minus.2.gff3"
+	params: args = config_dict["Internal"]["paraCombineGeneModels"]
+	singularity: image
+	shell:"""
+		combineGeneModels \
+		{params.args} \
+		{input.a} \
+		{input.t} \
+		{input.g} \
+		{input.i} \
+		> {output.one} \
+		2> {output.two}
+		"""
+def getCombineGeneModels_1(wildcards):
+	checkpoint_output = checkpoints.prepCombineGeneModels.get(**wildcards).output[0]
+	wc, = glob_wildcards(os.path.join(checkpoint_output, "{chr}_minus_augustus.gff3"))
+	return expand("GETA/Augustus/training/combineGeneModels_tmp/{chr}_{strand}.1.gff3", chr=wc, strand=["plus", "minus"])
+
+def getCombineGeneModels_2(wildcards):
+	checkpoint_output = checkpoints.prepCombineGeneModels.get(**wildcards).output[0]
+	wc, =glob_wildcards(os.path.join(checkpoint_output, "{chr}_minus_augustus.gff3"))
+	return expand("GETA/Augustus/training/combineGeneModels_tmp/{chr}_{strand}.2.gff3", chr=wc, strand=["plus", "minus"])
+
+rule aggregate_CombineGeneModels:
+	input: 
+		one = getCombineGeneModels_1,
+		two = getCombineGeneModels_2
+	output: 
+		one = "GETA/Augustus/training/combine.1.gff3",
+		two = "GETA/Augustus/training/combine.2.gff3"
+	shell:
+		"""
+		cat {input.one} > {output.one}
+		cat {input.two} > {output.two}
+		"""
+
+rule clearCombined:
+	input: "GETA/Augustus/training/combine.1.gff3"
+	output: "GETA/Augustus/training/geneModels.gff3"
+	params: g = genome
+	singularity: image
+	shell:
+		"""
+		GFF3Clear --genome {params.g} \
+		{input} > {output}
+		"""
+
+#TODO: remove all spots where geta makes '.ok files'
+rule geneModels2AugusutsTrainingInput:
+	input: "GETA/Augustus/training/geneModels.gff3"
+	output: 
+		one = "GETA/Augustus/training/ati.filter1.gff3",
+		two = "GETA/Augustus/training/ati.filter2.gff3"
+	threads: config_dict["geneModels2AugusutsTrainingInput"]["threads"] # Threads are for diamond
+	params: 
+		args = config_dict["Internal"]["geneModels2AugusutsTrainingInput"],
+		g = genome,
+		singularity = image
+	run:
+		shell("singularity exec {params.singularity} geneModels2AugusutsTrainingInput \
+		{params.args} \
+		--out_prefix ati \
+		--cpu {threads} \
+		{input} \
+		{params.g}")
+		
+		training_genes_number=0
+
+		with open('logs/geneModels2AugusutsTrainingInput..err', 'r') as file:
+			for line in file:
+				match = re.search(r'Best gene Models number:\s+(\d+)', line)
+				if match:
+					training_genes_number = int(match.group(1))
+					break
+
+		if training_genes_number < 1000:
+			shell("singularity exec {params.singularity} geneModels2AugusutsTrainingInput \
+			--min_evalue 1e-9 \
+			--min_identity 0.9 \
+			--min_coverage_ratio 0.9 \
+			--min_cds_num 1 \
+			--min_cds_length 450 \
+			--min_cds_exon_ratio 0.40 \
+			--keep_ratio_for_excluding_too_long_gene 0.99 \
+			--out_prefix ati \
+			--cpu {threads} \
+			{input} \
+			{params.g} 1> GETA/Augustus/training/geneModels2AugusutsTrainingInput.log.Loose_thresholds 2>&1")
+		
+		shell("mv ati.filter1.gff3 GETA/Augustus/training/ati.filter1.gff3") #TODO: Fix this in GETA
+		shell("mv ati.filter2.gff3 GETA/Augustus/training/ati.filter2.gff3") #TODO: Fix this in GETA
+
+rule BGM2AT:
+	input: 
+		gm = "GETA/Augustus/training/geneModels.gff3",
+		one = "GETA/Augustus/training/ati.filter1.gff3",
+		two = "GETA/Augustus/training/ati.filter2.gff3"
+	output:
+		"GETA/Augustus/firsttest.out", 
+		"GETA/Augustus/secondtest.out"
+	threads: config_dict["BGM2AT"]["threads"]
+	params: g = genome,
+		a_species = augustus_species,
+		a_start = None, # Augustus species start from
+		args = config_dict["Internal"]["BGM2AT"],
+		singularity = image
+	run:
+		gene_info = {}
+		flanking_length = []
+		gene_length = []
+
+		try:
+			os.remove("firsttest.ok") # TODO: Clean up these .ok files. Prevents re-running
+		except OSError:
+			pass
+		try:
+			os.remove("secondtest.ok")
+		except OSError:
+			pass
+		try:
+			os.remove("optimize_augustus.ok")
+		except OSError:
+			pass
+
+		with open("GETA/Augustus/training/geneModels.gff3", 'r') as IN:
+			for line in IN:
+				if "\tgene\t" in line:
+					fields = line.split("\t")
+					chromosome = fields[0]
+					strand = fields[6]
+					start_end = f"{fields[3]}\t{fields[4]}"
+					gene_info.setdefault(chromosome, {}).setdefault(strand, {})[start_end] = 1
+
+		for chromosome in gene_info:
+			for strand in gene_info[chromosome]:
+				regions = sorted(gene_info[chromosome][strand].keys())
+				first_region = regions.pop(0)
+				start, end = map(int, first_region.split("\t"))
+				gene_length.append(end - start + 1)
+				for region in regions:
+					aa, bb = map(int, region.split("\t"))
+					gene_length.append(bb - aa + 1)
+					distance = aa - end - 1
+					if distance >= 50:
+						flanking_length.append(distance)
+					end = max(end, bb)
+
+		gene_length.sort()
+		flanking_length.sort()
+		mid_flanking_length = flanking_length[len(flanking_length) // 2]
+		flanking_length = int(mid_flanking_length / 8)
+		mid_gene_length = gene_length[len(gene_length) // 2]
+		if flanking_length >= mid_gene_length:
+			flanking_length = mid_gene_length
+		
+		shell(f"singularity exec {params.singularity} cp -rf /opt/miniconda3/config ./GETA/Augustus/")
+		
+		#--augustus_species_start_from {params.a_start} \
+		shell(f"singularity exec {params.singularity} BGM2AT \
+		{params.args} \
+		--flanking_length {flanking_length} \
+		--CPU {threads} \
+		--onlytrain_GFF3 {input.one} {input.two} \
+		{params.g} \
+		{params.a_species}")
+
+		shell("mv -f firsttest.out GETA/Augustus/firsttest.out")
+		shell("mv -f secondtest.out GETA/Augustus/secondtest.out")
+
+rule prepareAugusutusHints:
+	input:
+		"GETA/transcript/intron.txt",
+		"GETA/transcript/transfrag.genome.gff3",
+		"GETA/homolog/genewise.gff3",
+		"GETA/homolog/genewise.start_stop_hints.gff"
+	output: "GETA/Augustus/hints.gff"
+	params: args = config_dict["Internal"]["prepareAugusutusHints"]
+	singularity: image
+	shell:
+		"""
+		prepareAugusutusHints \
+		{params.args} {input} > {output}
+		"""
+
+checkpoint prepAugustusWithHints:
+	input:
+		masked = "GETA/RepeatMasker/genome.masked.fasta",
+		hints = "GETA/Augustus/hints.gff",
+		transfrag = "GETA/transcript/transfrag.genome.gff3"
+	output: directory("GETA/Augustus/temp_directory")
+	run:
+		print("Reading transfrag.", file=sys.stderr)
+		gene_length = []
+		with open(input.transfrag, "r") as file:
+			for line in file:
+				if "\tgene\t" in line:
+					match = re.search(r"\tgene\t(\d+)\t(\d+)\t", line)
+					if match:
+						start, end = int(match.group(1)), int(match.group(2))
+						gene_length.append(end - start + 1)
+
+		gene_length.sort()
+
+		segmentSize, overlapSize = 5000000, 100000
+		if gene_length[-1] * 4 > overlapSize:
+			overlapSize = gene_length[-1] * 4
+			overlapSize_length = len(str(overlapSize))
+			overlapSize_length -= 2
+			overlapSize_length -= 1
+			overlapSize = int((overlapSize / (10 ** overlapSize_length)) + 1) * (10 ** overlapSize_length)
+			segmentSize = overlapSize * 50
+
+		print("Reading masked genome.", file=sys.stderr)
+		seq = readFasta(input.masked)
+		
+		print("Reading hints.", file=sys.stderr)
+		hints = {}
+		with open(input.hints, "r") as file:
+			for line in file:
+				data = line.strip().split("\t")
+				id = data[0]
+				hints[id] = hints.get(id, "") + line
+
+		extrinsic = """[SOURCES]
+		M RM E W P
+
+		[SOURCE-PARAMETERS]
+
+		[GENERAL]
+		      start      1        0.8  M    1  1e+100  RM  1     1    E 1    1000    W 1    1    P   1   1000
+		       stop      1        0.8  M    1  1e+100  RM  1     1    E 1    1000    W 1    1    P   1   1000
+		        tss      1          1  M    1  1e+100  RM  1     1    E 1    1    W 1    1    P   1   1
+		        tts      1          1  M    1  1e+100  RM  1     1    E 1    1    W 1    1    P   1   1
+		        ass      1  0.95  0.1  M    1  1e+100  RM  1     1    E 1    1    W 1    1    P   1   100
+		        dss      1  0.95  0.1  M    1  1e+100  RM  1     1    E 1    1    W 1    1    P   1   100
+		   exonpart      1  .992 .985  M    1  1e+100  RM  1     1    E 1    1e4  W 1    1    P   1   1
+		       exon      1          1  M    1  1e+100  RM  1     1    E 1    1    W 1    1    P   1   1
+		 intronpart      1          1  M    1  1e+100  RM  1     1    E 1    1    W 1    1    P   1   1
+		     intron      1       0.34  M    1  1e+100  RM  1     1    E 1    1e6  W 1    100  P   1   1e4
+		    CDSpart      1     1 .985  M    1  1e+100  RM  1     1    E 1    1    W 1    1    P   1   1e5
+		        CDS      1          1  M    1  1e+100  RM  1     1    E 1    1    W 1    1    P   1   1
+		    UTRpart      1     1    1  M    1  1e+100  RM  1     1    E 1    1    W 1    1    P   1   1
+		        UTR      1          1  M    1  1e+100  RM  1     1    E 1    1    W 1    1    P   1   1
+		     irpart      1          1  M    1  1e+100  RM  1     1    E 1    1    W 1    1    P   1   1
+		nonexonpart      1          1  M    1  1e+100  RM  1     1.15 E 1    1    W 1    1    P   1   1
+		  genicpart      1          1  M    1  1e+100  RM  1     1    E 1    1    W 1    1    P   1   1"""
+
+		tmp_dir = "GETA/Augustus/temp_directory"
+		if not os.path.exists(tmp_dir):
+			os.makedirs(tmp_dir)
+
+		with open("GETA/Augustus/temp_directory/extrinsic.cfg", "w") as file:
+			file.write(extrinsic)
+
+		out_id = {}
+		for seq_id in sorted(seq):
+			seq_length = len(seq[seq_id])
+			hints_info = hints.get(seq_id, "")
+			hints_info = hints_info.strip().split("\n")
+
+			if seq_length > segmentSize:
+				partitions = get_partition(seq_length, segmentSize, overlapSize)
+				last_end_hints = None
+				for part in partitions:
+					start = part - 1
+					end = start + segmentSize
+					sub_seq = seq[seq_id][start:end]
+
+					with open(f"{tmp_dir}/{seq_id}.{start}.fasta", "w") as out_file:
+						out_file.write(f">{seq_id}\n{sub_seq}\n")
+
+					with open(f"{tmp_dir}/{seq_id}.{start}.gff", "w") as out_file:
+						if last_end_hints:
+							last_end_hints = last_end_hints.strip().split("\n")
+							for hint in last_end_hints:
+								hint_data = hint.split("\t")
+								feature_start = int(hint_data[3]) - start
+								feature_end = int(hint_data[4]) - start
+								out_file.write(f"{hint_data[0]}\t{hint_data[1]}\t{hint_data[2]}\t{feature_start}\t{feature_end}\t{hint_data[5]}\t{hint_data[6]}\t{hint_data[7]}\t{hint_data[8]}\n")
+					
+						last_end_hints = ""
+						for info in hints_info:
+							info_data = info.split("\t")
+							if int(info_data[4]) <= end:
+								feature_start = int(info_data[3]) - start
+								feature_end = int(info_data[4]) - start
+								out_file.write(f"{info_data[0]}\t{info_data[1]}\t{info_data[2]}\t{feature_start}\t{feature_end}\t{info_data[5]}\t{info_data[6]}\t{info_data[7]}\t{info_data[8]}\n")
+								if int(info_data[3]) >= (end - overlapSize + 1):
+									last_end_hints += f"{info}\n"
+								hints_info.pop(0)
+							else:
+								break
+					
+					with open(f"{tmp_dir}/{seq_id}.{start}.segSize", "w") as out_file:
+						out_file.write(f"{segmentSize} {seq_length} {overlapSize}")
+
+					out_id.setdefault(seq_id, {})[f"{seq_id}.{start}"] = start
+			else:
+				with open(f"{tmp_dir}/{seq_id}.fasta", "w") as out_file:
+					out_file.write(f">{seq_id}\n{seq[seq_id]}\n")
+
+				with open(f"{tmp_dir}/{seq_id}.gff", "w") as out_file:
+					out_file.write("\n".join(hints_info))
+
+				out_id.setdefault(seq_id, {})[f"{seq_id}.0"] = 1
+
+				with open(f"{tmp_dir}/{seq_id}.segSize", "w") as out_file:
+					out_file.write(f"{segmentSize} {seq_length} {overlapSize}")
+
+		with open(f"{tmp_dir}/out_id.json", 'w') as out:
+			out.write(json.dumps(out_id))
+
+def getAugustusParams():
+	args = config_dict["Internal"]["paraAugusutusWithHints"].split(" ")
+	if "--alternatives_from_evidence" in args:
+		alt_from_evidence = "true"
+	else: 
+		alt_from_evidence = "false"
+	
+	mil = args[args.index("--min_intron_len") + 1]
+
+	return {"species":augustus_species,
+			"segmentSize":segSize,
+			"afe":alt_from_evidence,
+			"min_intron_len": mil}
+
+rule augustusWithHints:
+	input:
+		trained = "GETA/Augustus/firsttest.out",
+		hints = "GETA/Augustus/temp_directory/{seqid_start}.gff",
+		masked = "GETA/Augustus/temp_directory/{seqid_start}.fasta",
+		segSize = "GETA/Augustus/temp_directory/{seqid_start}.segSize"
+	output: "GETA/Augustus/temp_directory/{seqid_start}.out"
+	params: singularity = image,
+		species = augustus_species
+	run:
+		args = config_dict["Internal"]["paraAugusutusWithHints"].split(" ")
+		if "--alternatives_from_evidence" in args:
+			alt_from_evidence = "true"
+		else: 
+			alt_from_evidence = "false"
+		
+		mil = args[args.index("--min_intron_len") + 1]
+
+		with open(input.segSize) as f:
+			line = f.readline().strip('\n').split(" ")
+			segSize = line[0]
+			seqLength = line[1]
+		
+		if seqLength > segSize:
+			shell(f"singularity exec {params.singularity} augustus \
+			--gff3=on \
+			--species={params.species} \
+			--hintsfile={input.hints} \
+			--extrinsicCfgFile=GETA/Augustus/temp_directory/extrinsic.cfg \
+			--allow_hinted_splicesites=gcag,atac \
+			--alternatives-from-evidence={alt_from_evidence} \
+			--min_intron_len={mil} \
+			--softmasking=1 {input.masked} > {output}")
+		else:
+			shell(f"singularity exec {params.singularity} augustus \
+			--gff3=on \
+			--species={params.species} \
+			--hintsfile={input.hints} \
+			--extrinsicCfgFile=GETA/Augustus/temp_directory/extrinsic.cfg \
+			--allow_hinted_splicesites=gcag,atac \
+			--alternatives-from-evidence={alt_from_evidence} \
+			--min_intron_len=30 \
+			--softmasking=1 \
+			{input.masked} > {output}")
+
+def aggregate_augustusWithHints(wildcards):
+	outdir = checkpoints.prepAugustusWithHints.get(**wildcards).output[0]
+	wc, = glob_wildcards(os.path.join(outdir, "{seqid_start}.gff"))
+	return  expand(os.path.join(outdir, "{seqid_start}.out"), seqid_start=wc)
+
+rule combineAugustusWithHints:
+	input: aggregate_augustusWithHints
+	output: "GETA/Augustus/augustus.gff3"
+	run:
+		with open("GETA/Augustus/temp_directory/out_id.json", "r") as f:
+			out_id = json.load(f)
+		tmp_dir = "GETA/Augustus/temp_directory"
+		out = {}
+		info = ""
+		hints_supporting_ratio = {}
+		intron_supporting_info = {}
+		for seq_id in sorted(out_id.keys()):
+			partition = sorted(out_id[seq_id], key=lambda x: out_id[seq_id][x])
+			if len(partition) > 1:
+				margin_geneModels = []
+				geneModels = {}
+				overlap_geneModels = []
+				with open(f"{tmp_dir}/{partition[0]}.out", "r") as infile:
+					for line in infile:
+						if line.startswith("# % of transcript supported by hints (any source):"):
+							hints_supporting_ratio[info] = line.split(": ")[1].strip()
+						elif line.startswith("# CDS introns:"):
+							intron_supporting_info[info] = line.split(": ")[1].strip()
+						elif not line.startswith("#") and not line.strip() == "":
+							if "\tgene\t" in line:
+								data = line.strip().split("\t")
+								info = f"{data[0]}\t{data[6]}\t{data[3]}\t{data[4]}"
+								geneModels[info] = 1
+							out[info] = out.get(info, "") + line
+
+				margin_geneModels.append(info)
+				partition = partition[1:]
+
+				for part in partition:
+					locus = int(part.split(".")[-1])
+					gene = []
+					keep = True
+					with open(f"{tmp_dir}/{part}.out", "r") as infile, open(f"{tmp_dir}/{part}.segSize", "r") as ss:
+						overlapSize = int(ss.readline().strip("\n").split(" ")[2])
+						for line in infile:
+							if line.startswith("# % of transcript supported by hints (any source):"):
+								hints_supporting_ratio[info] = line.split(": ")[1].strip()
+							elif line.startswith("# CDS introns:"):
+								intron_supporting_info[info] = line.split(": ")[1].strip()
+							elif not line.startswith("#") and not line.strip() == "":
+								data = line.strip().split("\t")
+								start = int(data[3]) + locus
+								end = int(data[4]) + locus
+								if data[2] == "gene":
+									info = f"{data[0]}\t{data[6]}\t{start}\t{end}"
+									if info in out:
+										keep = False
+									else:
+										keep = True
+										if int(data[3]) <= overlapSize:
+											overlap_geneModels.append(info)
+									gene.append(info)
+									geneModels[info] = 1
+								if keep:
+									out[info] = out.get(info, "") + f"{data[0]}\t{data[1]}\t{data[2]}\t{start}\t{end}\t{data[5]}\t{data[6]}\t{data[7]}\t{data[8]}\n"
+
+					margin_geneModels.append(gene[0])
+					margin_geneModels.append(gene[-1])
+				remove_out = []
+				for gene in margin_geneModels:
+					gene_info = gene.split("\t")
+					for key in geneModels.keys():
+						if gene == key:
+							continue
+						key_info = key.split("\t")
+						if int(gene_info[2]) <= int(key_info[3]) and int(gene_info[3]) >= int(key_info[2]):
+							remove_out.append(gene)
+				
+				for gene in remove_out:
+					if gene in out: del out[gene]
+					if gene in geneModels: del geneModels[gene]
+				
+				remove_out = []
+				for gene in overlap_geneModels:
+					gene_info = gene.split("\t")
+					for key in geneModels.keys():
+						if gene == key:
+							continue
+						key_info = key.split("\t")
+						if int(gene_info[2]) <= int(key_info[3]) and int(gene_info[3]) >= int(key_info[2]):
+							remove_out.append(gene)
+				for gene in remove_out:
+					if gene in out:
+						del out[gene]
+			else:
+				with open(f"{tmp_dir}/{seq_id}.out", "r") as infile:
+					for line in infile:
+						if line.startswith("# % of transcript supported by hints (any source):"):
+							hints_supporting_ratio[info] = line.split(": ")[1].strip()
+						elif line.startswith("# CDS introns:"):
+							intron_supporting_info[info] = line.split(": ")[1].strip()
+						elif not line.startswith("#") and not line.strip() == "":
+							if "\tgene\t" in line:
+								data = line.strip().split("\t")
+								info = f"{data[0]}\t{data[6]}\t{data[3]}\t{data[4]}"
+							out[info] = out.get(info, "") + line
+
+		sort1 = {}
+		sort2 = {}
+		sort3 = {}
+		sort4 = {}
+
+		for key in out:
+			data = key.split("\t")
+			sort1[key] = data[0]
+			sort2[key] = data[1]
+			sort3[key] = int(data[2])
+			sort4[key] = int(data[3])
+
+		num = 0
+		out_sorted = sorted(out.keys(), key=lambda x: (sort1[x], sort3[x], sort4[x], sort2[x]))
+		with open("GETA/Augustus/augustus.gff3", 'w') as outfile:
+			for key in out_sorted:
+				info = key
+				num += 1
+				gene_id = "AUGUSTUS" + "0" * (len(str(len(str(out_sorted)))) - len(str(num))) + str(num)
+				lines = out[key].split("\n")
+				for line in lines:
+					if line == "":
+						continue
+					elif "\tgene\t" in line:
+						line = re.sub(r"(ID=[^;]+)", r"\1;hintRatio=" + hints_supporting_ratio[info] + ";intronSupport=" + intron_supporting_info[info], line)
+					line = re.sub(r"\ttranscript\t", "\tmRNA\t", line)
+					line = re.sub(r"ID=g\d+", "ID=" + gene_id, line)
+					line = re.sub(r"Parent=g\d+", "Parent=" + gene_id, line)
+					outfile.write(line + "\n")
+
+
+# Step 6. Combine Gene Models
+checkpoint prepCombineGeneModels_step6:
+	input:
+		transfrag = "GETA/transcript/transfrag.genome.gff3",
+		genewise = "GETA/homolog/genewise.gff3",
+		augustus = "GETA/Augustus/augustus.gff3",
+		hints = "GETA/Augustus/hints.gff"
+	output:
+		directory("GETA/CombineGeneModels/combineGeneModels_tmp")
+	run:
+		readme = """geneModels.a.gff3\tGene models obtained after the first round of integration, primarily based on AUGUSTUS predictions and supported by sufficient evidence.
+					geneModels.b.gff3\tGene models obtained after the first round of integration, predicted by AUGUSTUS but not supported by sufficient evidence.
+					geneModels.c.gff3\tGene models obtained from the integration of Transcript and Homolog predictions, fully supported by evidence.
+					geneModels.d.gff3\tGene models obtained after the second round of integration, primarily based on Transcript and Homolog predictions and optimized.
+					geneModels.e.gff3\tComplete gene models obtained by successfully filling gaps in incomplete gene models from geneModels.d.gff3.
+					geneModels.f.gff3\tIncomplete gene models obtained after attempts to fill gaps in incomplete gene models from geneModels.d.gff3.
+					geneModels.gb_AS.gff3\tResults of alternative splicing analysis on gene models from geneModels.b.gff3, with additional transcripts lacking CDS information.
+					geneModels.ge_AS.gff3\tResults of alternative splicing analysis on gene models from geneModels.e.gff3, with additional transcripts lacking CDS information.
+					geneModels.gf_AS.gff3\tResults of alternative splicing analysis on gene models from geneModels.f.gff3, with additional transcripts lacking CDS information.
+					geneModels.gb.gff3\tResults of alternative splicing analysis on gene models from geneModels.b.gff3, with additional transcripts containing CDS information.
+					geneModels.ge.gff3\tResults of alternative splicing analysis on gene models from geneModels.e.gff3, with additional transcripts containing CDS information.
+					geneModels.gf.gff3\tResults of alternative splicing analysis on gene models from geneModels.f.gff3, with additional transcripts containing CDS information.
+					geneModels.h.coding.gff3\tFiltered gene models obtained by retaining coding protein-coding gene models.
+					geneModels.h.lncRNA.gff3\tFiltered gene models obtained by retaining lnc_RNA gene models.
+					geneModels.h.lowQuality.gff3\tFiltered gene models obtained by retaining low-quality gene models.
+					geneModels.i.coding.gff3\tGene models from geneModels.h.coding.gff3 that have been forcibly completed."""
+		
+		with open("GETA/CombineGeneModels/geneModels.README", 'w') as rm:
+			rm.write(readme)
+		
+		chr = {}
+		augustus = {}
+		with open(input.augustus, 'r') as IN:
+			for line in IN:
+				if line.startswith("#") or line.strip() == "":
+					continue
+				fields = line.split("\t")
+				chr[fields[0]] = 1
+				if fields[0] in augustus:
+					if fields[6] in augustus[fields[0]]:
+						augustus[fields[0]][fields[6]] += line
+					else:
+						augustus[fields[0]][fields[6]] = line
+				else:
+					augustus[fields[0]] = {fields[6]: line}
+
+		transfrag = {}
+		with open(input.transfrag, 'r') as IN:
+			for line in IN:
+				if line.startswith("#") or line.strip() == "":
+					continue
+				fields = line.split("\t")
+				chr[fields[0]] = 1
+				if fields[0] in transfrag:
+					if fields[6] in transfrag[fields[0]]:
+						transfrag[fields[0]][fields[6]] += line
+					else:
+						transfrag[fields[0]][fields[6]] = line
+				else:
+					transfrag[fields[0]] = {fields[6]: line}
+
+		genewise = {}
+		with open(input.genewise, 'r') as IN:
+			for line in IN:
+				if line.startswith("#") or line.strip() == "":
+					continue
+				fields = line.split("\t")
+				chr[fields[0]] = 1
+				if fields[0] in genewise:
+					if fields[6] in genewise[fields[0]]:
+						genewise[fields[0]][fields[6]] += line
+					else:
+						genewise[fields[0]][fields[6]] = line
+				else:
+					genewise[fields[0]] = {fields[6]: line}
+
+		intron = {}
+		with open(input.hints, 'r') as IN:
+			lines = IN.readlines()[:-1] # Skip last line, which contains header
+			for line in lines:
+				if line.startswith("#") or line.strip() == "":
+					continue
+				fields = line.split("\t")
+				chr[fields[0]] = 1
+				if fields[2] == "intron":
+					if fields[6] == '.':
+						if fields[0] in intron:
+							if "+" in intron[fields[0]]:
+								intron[fields[0]]['+'] += line
+							else:
+								intron[fields[0]]['+'] = line
+
+							if "-" in intron[fields[0]]:
+								intron[fields[0]]['-'] += line
+							else:
+								intron[fields[0]]['-'] = line
+						else:
+							intron[fields[0]] = {"+": line}
+							intron[fields[0]]["-"] = line
+						
+					else:
+						if fields[0] in intron:
+							if fields[6] in intron[fields[0]]:
+								intron[fields[0]][fields[6]] += line
+							else:
+								intron[fields[0]][fields[6]] = line
+						else:
+							intron[fields[0]] = {fields[6]: line}
+
+		tmp = "GETA/CombineGeneModels/combineGeneModels_tmp"
+		if not os.path.exists(tmp):
+			os.mkdir(tmp)
+
+		out_name = []
+		for chr_key in sorted(chr.keys()):
+			with open(f"{tmp}/{chr_key}_plus_augustus.gff3", 'w') as OUT:
+				try:
+					OUT.write(augustus[chr_key]["+"])
+				except:
+					pass
+
+			with open(f"{tmp}/{chr_key}_minus_augustus.gff3", 'w') as OUT:
+				try:
+					OUT.write(augustus[chr_key]["-"])
+				except:
+					pass
+
+			with open(f"{tmp}/{chr_key}_plus_transfrag.gff3", 'w') as OUT:
+				try:
+					OUT.write(transfrag[chr_key]["+"])
+				except:
+					pass
+
+			with open(f"{tmp}/{chr_key}_minus_transfrag.gff3", 'w') as OUT:
+				try:
+					OUT.write(transfrag[chr_key]["-"])
+				except:
+					pass
+
+			with open(f"{tmp}/{chr_key}_plus_genewise.gff3", 'w') as OUT:
+				try:
+					OUT.write(genewise[chr_key]["+"])
+				except:
+					pass
+
+			with open(f"{tmp}/{chr_key}_minus_genewise.gff3", 'w') as OUT:
+				try:
+					OUT.write(genewise[chr_key]["-"])
+				except:
+					pass
+
+			with open(f"{tmp}/{chr_key}_plus_intron.gff", 'w') as OUT:
+				try:
+					OUT.write(intron[chr_key]["+"])
+				except:
+					pass
+
+			with open(f"{tmp}/{chr_key}_minus_intron.gff", 'w') as OUT:
+				try:
+					OUT.write(intron[chr_key]["-"])
+				except:
+					pass
+
+rule combineGeneModelsPlus_step6:
+	input: 
+		a = "GETA/CombineGeneModels/combineGeneModels_tmp/{chr}_plus_augustus.gff3",
+		t = "GETA/CombineGeneModels/combineGeneModels_tmp/{chr}_plus_transfrag.gff3",
+		g = "GETA/CombineGeneModels/combineGeneModels_tmp/{chr}_plus_genewise.gff3",
+		i = "GETA/CombineGeneModels/combineGeneModels_tmp/{chr}_plus_intron.gff"
+	output:
+		one = "GETA/CombineGeneModels/combineGeneModels_tmp/{chr}_plus.1.gff3",
+		two = "GETA/CombineGeneModels/combineGeneModels_tmp/{chr}_plus.2.gff3"
+	params: args = config_dict["Internal"]["paraCombineGeneModels"]
+	singularity: image
+	shell:
+		"""
+		combineGeneModels \
+		{params.args} \
+		{input.a} \
+		{input.t} \
+		{input.g} \
+		{input.i} \
+		> {output.one} \
+		2> {output.two}
+		"""
+
+rule combineGeneModelsMinus_step6:
+	input: 
+		a = "GETA/CombineGeneModels/combineGeneModels_tmp/{chr}_minus_augustus.gff3",
+		t = "GETA/CombineGeneModels/combineGeneModels_tmp/{chr}_minus_transfrag.gff3",
+		g = "GETA/CombineGeneModels/combineGeneModels_tmp/{chr}_minus_genewise.gff3",
+		i = "GETA/CombineGeneModels/combineGeneModels_tmp/{chr}_minus_intron.gff"
+	output:
+		one = "GETA/CombineGeneModels/combineGeneModels_tmp/{chr}_minus.1.gff3",
+		two = "GETA/CombineGeneModels/combineGeneModels_tmp/{chr}_minus.2.gff3"
+	params: args = config_dict["Internal"]["paraCombineGeneModels"]
+	singularity: image
+	shell:
+		"""
+		combineGeneModels \
+		{params.args} \
+		{input.a} \
+		{input.t} \
+		{input.g} \
+		{input.i} \
+		> {output.one} \
+		2> {output.two}
+		"""
+def getCombineGeneModels_step6_1(wildcards):
+	checkpoint_output = checkpoints.prepCombineGeneModels_step6.get(**wildcards).output[0]
+	wc, = glob_wildcards(os.path.join(checkpoint_output, "{chr}_minus_augustus.gff3"))
+	return expand("GETA/CombineGeneModels/combineGeneModels_tmp/{i}_{strand}.1.gff3", i=wc , strand=["plus", "minus"])
+
+def getCombineGeneModels_step6_2(wildcards):
+	checkpoint_output = checkpoints.prepCombineGeneModels_step6.get(**wildcards).output[0]
+	wc, =glob_wildcards(os.path.join(checkpoint_output, "{chr}_minus_augustus.gff3"))
+	return expand("GETA/CombineGeneModels/combineGeneModels_tmp/{i}_{strand}.2.gff3", i=wc, strand=["plus", "minus"])
+
+rule aggregate_CombineGeneModels_step6:
+	input: 
+		one = getCombineGeneModels_step6_1,
+		two = getCombineGeneModels_step6_2
+	output: 
+		one = "GETA/CombineGeneModels/combine.1.gff3",
+		two = "GETA/CombineGeneModels/combine.2.gff3"
+	shell:
+		"""
+		cat {input.one} > {output.one}
+		cat {input.two} > {output.two}
+		"""
+
+rule clearCombined_step6:
+	input: 
+		one = "GETA/CombineGeneModels/combine.1.gff3",
+		two = "GETA/CombineGeneModels/combine.2.gff3"
+	output: 
+		a = "GETA/CombineGeneModels/geneModels.a.gff3",
+		b = "GETA/CombineGeneModels/geneModels.b.gff3"
+	params: g = genome
+	singularity: image
+	shell:'''
+		GFF3Clear \
+		--genome {params.g} \
+		--no_attr_add \
+		--coverage 0.8 \
+		{input.one} > {output.a}
+
+		GFF3Clear \
+		--genome {params.g} \
+		--no_attr_add \
+		--coverage 0.8 \
+		{input.two} > {output.b}
+
+		perl -p -i -e "s/(=[^;]+)\\.t1/\\$1.t01/g" GETA/CombineGeneModels/geneModels.a.gff3 GETA/CombineGeneModels/geneModels.b.gff3
+		'''
+
+rule pickBetterModels:
+	input:
+		geneModels = "GETA/Augustus/training/geneModels.gff3",
+		a = "GETA/CombineGeneModels/geneModels.a.gff3"
+	output:
+		c = "GETA/CombineGeneModels/geneModels.c.gff3",
+		d = "GETA/CombineGeneModels/geneModels.d.gff3"
+	params: 
+		args = config_dict["Internal"]['pickout_better_geneModels_from_evidence'],
+		g = genome
+	singularity: image
+	shell:"""
+		perl -p -e 's/(=[^;]+)\\.t1/\\$1.t01/g;' {input.geneModels} > {output.c}
+
+		agat_convert_sp_gxf2gxf.pl \
+		-gff {input.a} \
+		-o GETA/CombineGeneModels/geneModels.a.clean.gff3
+
+		agat_convert_sp_gxf2gxf.pl \
+		-gff {output.c} \
+		-o GETA/CombineGeneModels/geneModels.c.clean.gff3
+
+		mv GETA/CombineGeneModels/geneModels.a.clean.gff3 {input.a}
+		mv GETA/CombineGeneModels/geneModels.c.clean.gff3 {output.c}
+
+		pickout_better_geneModels_from_evidence \
+		{params.args} \
+		{input.a} \
+		{output.c} > GETA/CombineGeneModels/picked_evidence_geneModels.gff3
+
+		GFF3Clear \
+		--genome {params.g} \
+		--no_attr_add GETA/CombineGeneModels/picked_evidence_geneModels.gff3 \
+		{input.a} > {output.d}
+
+		perl -p -i -e 's/Integrity=[^;]+;?//g' {output.d}
+		"""
+
+rule fillingEndsOfGeneModels_ef:
+	input: d = "GETA/CombineGeneModels/geneModels.d.gff3"
+	output: 
+		e = "GETA/CombineGeneModels/geneModels.e.gff3",
+		f = "GETA/CombineGeneModels/geneModels.f.gff3"
+	params: 
+		g = genome,
+		args  = config_dict["Internal"]["fillingEndsOfGeneModels"]
+	singularity: image
+	shell:
+		"""
+		fillingEndsOfGeneModels \
+		{params.args} \
+		--filling_need_transcriptID GETA/CombineGeneModels/filling_need_transcriptID.txt \
+		--nonCompletedGeneModels {output.f} \
+		{params.g} \
+		{input.d} > {output.e} 2> GETA/CombineGeneModels/fillingEndsOfGeneModels.1.log
+		"""
+
+rule extractTranscriptsForFilter:
+	input:
+		repeat = "GETA/RepeatMasker/genome.repeat.gff3",
+		b = "GETA/CombineGeneModels/geneModels.b.gff3",
+		e = "GETA/CombineGeneModels/geneModels.e.gff3",
+		f = "GETA/CombineGeneModels/geneModels.f.gff3"
+	output: 
+		ids = "GETA/CombineGeneModels/transcriptID_for_filtering.txt",
+		prots_all = "GETA/CombineGeneModels/proteins_all.fasta",
+		prots_filter = "GETA/CombineGeneModels/proteins_for_filtering.fasta"
+	params: 
+		args = config_dict["Internal"]["GFF3_extract_TranscriptID_for_filtering"],
+		g = genome
+	singularity: image
+	shell:'''
+		GFF3_extract_TranscriptID_for_filtering \
+		{params.args} \
+		{input.repeat} \
+		{input.b} \
+		{input.e} \
+		{input.f} \
+		> {output.ids}
+		
+		perl -ne "print \\\"\\$1\\tNotEnoughEvidence\\n\\\" if m/ID=([^;]*\\.t\\d+);/;" {input.b} >> {output.ids}
+		perl -ne "print \\\"\\$1\\tFilling2Uncomplete\\n\\\" if m/ID=([^;]*\\.t\\d+);/;" {input.f} >> {output.ids}
+
+		gff3_to_protein.pl \
+		{params.g} \
+		{input.b} \
+		{input.f} \
+		{input.e} > \
+		{output.prots_all} 2> gff3_to_protein.log
+		
+		perl -p -i -e \'s/\\*\\$//\' {output.prots_all}
+		
+		fasta_extract_subseqs_from_list.pl \
+		{output.prots_all} \
+		{output.ids} \
+		> {output.prots_filter} 2> GETA/CombineGeneModels/fasta_extract_subseqs_from_list.log
+		'''
+
+def getHMMscanNumbers():
+	num = []
+	for i in range(1,21):
+		num.append(str(i).zfill(3))
+	return num
+
+rule splitFilterProteins:
+	input: "GETA/CombineGeneModels/proteins_for_filtering.fasta"
+	output: expand("GETA/CombineGeneModels/hmmscan.temp/proteins_for_filtering.part_{number}.fasta", number=getHMMscanNumbers())
+	singularity: image
+	shell:
+		"""
+		seqkit split -p 20 --force -O GETA/CombineGeneModels/hmmscan.temp {input}
+		"""
+#TODO: All the parts need to be checkpointed or added to rule all...?
+rule filterHMMScan:
+	input: "GETA/CombineGeneModels/hmmscan.temp/proteins_for_filtering.part_{number}.fasta"
+	output: 
+		out = "GETA/CombineGeneModels/hmmscan.temp/proteins_for_filtering.part_{number}.txt",
+		tbl = "GETA/CombineGeneModels/hmmscan.temp/proteins_for_filtering.part_{number}.tbl",
+		dom = "GETA/CombineGeneModels/hmmscan.temp/proteins_for_filtering.part_{number}.domtbl",
+		pfam = "GETA/CombineGeneModels/hmmscan.temp/proteins_for_filtering.part_{number}.pfamtbl"
+	singularity: image
+	threads: config_dict["filterHMMScan"]["threads"]
+	shell:
+		"""
+		hmmscan \
+		--cpu {threads} \
+		-E 0.001 \
+		--domE 0.001 \
+		-o {output.out} \
+		--tblout {output.tbl} \
+		--domtblout {output.dom} \
+		--pfamtblout {output.pfam} \
+		/usr/local/src/Pfam-A.hmm \
+		{input}
+		"""
+
+def match_length(region_list):
+	inter_sorted_site = sorted(region_list, key=lambda x: int(x.split('\t')[0]))
+
+	out_site_number = 0
+	former_region = inter_sorted_site.pop(0)
+	aaa = [x for x in map(int, former_region.split("\t"))]
+	out_site_number += (aaa[1] - aaa[0] + 1)
+	for region in inter_sorted_site:
+		former_region = [x for x in map(int, former_region.split("\t"))]
+		present_region = [x for x in map(int, region.split('\t'))]
+
+		if present_region[0] > former_region[1]:
+			out_site_number += (present_region[1] - present_region[0] + 1)
+			former_region = region
+		elif present_region[1] > former_region[1]:
+			out_site_number += (present_region[1] - former_region[1])
+			former_region = region
+		else:
+			former_region = region
+
+	return out_site_number
+
+rule combineHMMScan:
+	input: expand("GETA/CombineGeneModels/hmmscan.temp/proteins_for_filtering.part_{number}.domtbl", number=getHMMscanNumbers())
+	output: "GETA/CombineGeneModels/validation_hmmscan.tab"
+	run:
+		#TODO: set parameters dynamically from config_dict["Internal"]
+		evalue1=1e-5
+		evalue2=1e-3
+		hmm_length=80
+		coverage=0.25
+
+		if os.path.exists(output[0]):
+			os.system(f"rm {output[0]}")
+
+		for filename in input:
+			with open(filename, 'r') as f:
+				info = {}
+				for line in f:
+					if not line.startswith('#'):
+						data = line.split()
+						gene_id, name = data[3], data[0]
+						info.setdefault(gene_id, {}).setdefault(name, []).append(line)
+
+			annot = {}
+			for gene_id in info.keys():
+				for name in info[gene_id].keys():
+					match_region_of_hmm = []
+					for line in info[gene_id][name]:
+						data = line.split()
+						evalue = float(data[6])
+						match_region_of_hmm.append(f"{data[15]}\t{data[16]}")
+						hmm_len = int(data[2])
+						accession = data[1]
+						score = float(data[7])
+						description = " ".join(data[22:])
+
+					match_length_value = match_length(match_region_of_hmm)
+					hmm_coverage = 0
+					if hmm_len:
+						hmm_coverage = match_length_value / hmm_len
+
+					if hmm_coverage < coverage:
+						continue
+					if evalue > evalue2:
+						continue
+					if hmm_len >= hmm_length and evalue > evalue1:
+						continue
+
+					annot.setdefault(gene_id, {}).setdefault(name, {})["evalue"] = evalue
+					hmm_coverage = round(hmm_coverage * 100, 2)
+					annot[gene_id][name]["out"] = f"{gene_id}\t{accession}\t{name}\t{evalue}\t{score}\t{hmm_coverage}%\t{description}\n"
+
+			with open(output[0], "a") as OUT:
+				for gene_id in sorted(annot.keys()):
+					for name in sorted(annot[gene_id].keys(), key=lambda x: annot[gene_id][x]["evalue"]):
+						OUT.write(annot[gene_id][name]["out"])
+
+rule makeFilterBlastDB:
+	input: rules.mergeProteins.output.m
+	output: "GETA/CombineGeneModels/diamond.temp/homolog.dmnd"
+	singularity: image
+	shell:"""
+		diamond makedb --db GETA/CombineGeneModels/diamond.temp/homolog --in {input}
+		"""
+
+rule filterBlastP:
+	input:
+		db = "GETA/CombineGeneModels/diamond.temp/homolog.dmnd",
+		prots = "GETA/CombineGeneModels/proteins_for_filtering.fasta"
+	output: "GETA/CombineGeneModels/diamond.temp/proteins_for_filtering.blastp.xml"
+	threads: config_dict["filterBlastP"]["threads"]
+	singularity: image
+	params: args = config_dict["Internal"]["diamond"]
+	shell:"""
+		diamond \
+		blastp \
+		{params.args} \
+		--outfmt 5 \
+		--db {input.db} \
+		--query {input.prots} \
+		--out {output} \
+		--threads {threads}
+		"""
+
+rule parseBlastResult:
+	input: "GETA/CombineGeneModels/diamond.temp/proteins_for_filtering.blastp.xml"
+	output: "GETA/CombineGeneModels/validation_blastp.tab"
+	singularity: image
+	params: args = config_dict["Internal"]["parsing_blast_result"]
+	shell:
+		"""
+		parsing_blast_result.pl \
+		{params.args} \
+		--out-hit-confidence \
+		{input} \
+		> {output}
+		"""
+
+rule validateTranscripts:
+	input: 
+		hmm = "GETA/CombineGeneModels/validation_hmmscan.tab",
+		blast = "GETA/CombineGeneModels/validation_blastp.tab",
+		ids = "GETA/CombineGeneModels/transcriptID_for_filtering.txt",
+		b = "GETA/CombineGeneModels/geneModels.b.gff3",
+		e = "GETA/CombineGeneModels/geneModels.e.gff3",
+		f = "GETA/CombineGeneModels/geneModels.f.gff3"
+	output: 
+		coding = "GETA/CombineGeneModels/geneModels.h.coding.gff3",
+		lnc = "GETA/CombineGeneModels/geneModels.h.lncRNA.gff3"
+	singularity: image
+	params: 
+		args_gm = config_dict["Internal"]["get_valid_geneModels"],
+		args_tr = config_dict["Internal"]["get_valid_transcriptID"]
+	shell:"""
+		get_valid_transcriptID \
+		{params.args_tr} \
+		{input.hmm} \
+		{input.blast} \
+		> GETA/CombineGeneModels/transcriptID_validating_passed.tab \
+		2> GETA/CombineGeneModels/get_valid_transcriptID.log
+
+		get_valid_geneModels \
+		{params.args_gm} \
+		--out_prefix GETA/CombineGeneModels/geneModels.h \
+		{input.ids} \
+		GETA/CombineGeneModels/transcriptID_validating_passed.tab \
+		{input.b} \
+		{input.e} \
+		{input.f} \
+		2> GETA/CombineGeneModels/get_valid_geneModels.log
+		"""
+
+rule fillingEndsOfGeneModels_final:
+	input: "GETA/CombineGeneModels/geneModels.h.coding.gff3"
+	output: "GETA/CombineGeneModels/geneModels.i.coding.gff3"
+	singularity: image
+	params: 
+		args = config_dict["Internal"]["fillingEndsOfGeneModels"],
+		g = genome
+	shell:"""
+		fillingEndsOfGeneModels \
+		{params.args} \
+		{params.g} \
+		{input} > {output} \
+		2> GETA/CombineGeneModels/fillingEndsOfGeneModels.2.log
+		"""
+
+#Step 7. GETA output
+
+rule GETA_output:
+	input:
+		i = "GETA/CombineGeneModels/geneModels.i.coding.gff3",
+		h = "GETA/CombineGeneModels/geneModels.h.lncRNA.gff3"
+	output:
+		gm = f"GETA/{config_dict['Input']['prefix']}.geneModels.gff3",
+		bgm = f"GETA/{config_dict['Input']['prefix']}.bestGeneModels.gff3"
+	params:
+		g = genome,
+		prefix = "geta." + config_dict["Input"]["prefix"]
+	singularity: image
+	shell:
+		"""
+		GFF3Clear \
+		  --GFF3_source GETA \
+		  --gene_prefix GETA \
+		  --gene_code_length 6 \
+		  --genome {params.g} \
+		  {input.i} \
+		  > {output.gm}
+
+		GFF3_extract_bestGeneModels \
+		  {output.gm} \
+		  > {output.bgm}
+
+		GFF3Clear \
+		  --GFF3_source GETA \
+		  --gene_prefix getancGene  \
+		  --gene_code_length 6 \
+		  --genome {params.g} \
+		  --no_attr_add {input.h} \
+		  > GETA/{params.prefix}.geneModels_lncRNA.gff3
+		
+		gff3ToGtf.pl \
+		  {params.g} {output.gm} \
+		  > GETA/{params.prefix}.geneModels.gtf
+
+		gff3ToGtf.pl \
+		  {params.g} \
+		  {output.bgm} \
+		  > GETA/{params.prefix}.bestGeneModels.gtf
+
+		eukaryotic_gene_model_statistics.pl \
+		  GETA/{params.prefix}.bestGeneModels.gtf \
+		  {params.g} \
+		  {params.prefix} &> GETA/{params.prefix}.geneModels.stats
+		"""
+############# End GETA Snakemake ###############
+
+# TODO: fetch helixer lineage with fetch_helixer_model.py: file goes here os.path.join(appdirs.user_data_dir('Helixer'), 'models')
+# TODO: allow users to specifiy path and singularity binding
+rule helixer:
+	input: 
+		g = genome
+	params: 
+		s = image,
+		l = helixer_model,
+		subseq=config_dict["Input"]["helixer_subseq"]
+	output: f"AB_INITIO/Helixer/{prefix}_helixer.gff3"
+	shell: '''
+		singularity exec {params.s} conda run -n helixer \
+		Helixer.py \
+		  --fasta-path {input.g} \
+		  --model-filepath /usr/local/src/HelixerPost/helixer_post_bin/{params.l}.h5 \
+		  --subsequence-length {params.subseq} \
+		  --gff-output-path {output}
+		'''
+
+rule prepare_liftoff:
+	output: 
+		"OTHER/LiftOff/combined.fasta",
+		"OTHER/LiftOff/combined.gff3"
+	params: 
+		neighbor_fasta = config_dict["Input"]["liftoff"]["neighbor_fasta"],
+		neighbor_gff = config_dict["Input"]["liftoff"]["neighbor_gff"]
+	run:
+		# TODO: check this... may need better heuristics for making chromosome names unique? 
+		# TODO: write it into a python script and ensure unique chromosome names using hashes?
+		
+		# Uniquify chromosome names and combine everything
+		shell("if test -f OTHER/LiftOff/combined.fasta; then rm OTHER/LiftOff/combined.fasta;fi")
+		shell('for fasta in $(find {params.neighbor_fasta} -regextype sed -regex ".*.fa\\(sta\\)\\{{0,1\\}}$"); do \
+			bn=$(basename $fasta); \
+			tri=${{bn:0:3}}; \
+			cat $fasta | sed "s/^>/>${{tri}}/" >> OTHER/LiftOff/combined.fasta; \
+			done')
+		shell("if test -f OTHER/LiftOff/combined.gff3;then rm OTHER/LiftOff/combined.gff3;fi")
+		shell('for gff in $(find {params.neighbor_gff} -regextype sed -regex ".*\\.gff3\\{{0,1\\}}$"); do \
+			bn=$(basename $gff); \
+			tri=${{bn:0:3}}; \
+			cat $gff | sed "s/^\\([a-zA-Z0-9]\\)/${{tri}}\\1/" | sed "/^#/d" >> OTHER/LiftOff/combined.gff3; \
+			done')
+
+rule liftoff:
+	input:
+		g = genome,
+		combined_fasta = "OTHER/LiftOff/combined.fasta",
+		combined_gff = "OTHER/LiftOff/combined.gff3"
+	output: f"OTHER/LiftOff/{prefix}_liftoff.gff3"
+	threads: config_dict["liftoff"]["threads"]
+	singularity: image
+	shell: "liftoff \
+				{input.g} {input.combined_fasta} -g {input.combined_gff}  \
+				-p {threads} \
+				-flank 0.4 \
+				-copies \
+				-cds \
+				-o {output}"
+
+########## Genome_Annotation_Post ####################
+
+rule gmapPrep:
+	input:
+		combined_fasta = "OTHER/LiftOff/combined.fasta",
+		combined_gff = "OTHER/LiftOff/combined.gff3"
+	output:
+		"TRANSCRIPT/Gmap/liftoffExon.fasta",
+		"TRANSCRIPT/Gmap/DB/DB.chromosome"
+	singularity: image
+	params:genome = config_dict["Input"]["genome"]
+	shell:
+		"""
+		grep -P '\texon\t' {input.combined_gff} > TRANSCRIPT/Gmap/liftoffExon.gff3
+		bedtools getfasta -fi {input.combined_fasta} -fo TRANSCRIPT/Gmap/liftoffExon.fasta -bed TRANSCRIPT/Gmap/liftoffExon.gff3
+		gmap_build -D TRANSCRIPT/Gmap -d DB {params.genome}
+		"""
+
+rule gmapExon:
+	input: "TRANSCRIPT/Gmap/DB/DB.chromosome"
+	output: "TRANSCRIPT/Gmap/gmapExon.gff3"
+	threads: config_dict["gmapExon"]["threads"]
+	singularity: image
+	shell:
+		"""
+		gmap -D TRANSCRIPT/Gmap -d DB -t {threads}  --min-identity=0.7 \
+		--min-trimmed-coverage=0.85 --cross-species \
+		--max-intronlength-middle=0  \
+		--max-intronlength-ends=0 --mapexons -p 1 -f 3 \
+		-n 2 --gff3-cds=genomic \
+		TRANSCRIPT/Gmap/liftoffExon.fasta 1> TRANSCRIPT/Gmap/gmapExon.gff3
+		"""
+
+rule bam2Fasta:
+	input: f"GETA/HiSat2/hisat2.sorted.bam"
+	output: "TRANSCRIPT/HiSat/hisat2.sorted.rmdup.fasta"
+	threads: config_dict["bam2Fasta"]["threads"]
+	singularity: image
+	shell:""" 
+		samtools fasta \
+		  -f 0x40 \
+		  -F 0x904 \
+		  --threads {threads} \
+		  {input} > {output} 
+		"""
+
+rule spades:
+	input: "TRANSCRIPT/HiSat/hisat2.sorted.rmdup.fasta"
+	output: "TRANSCRIPT/spades/hard_filtered_transcripts.fasta"
+	threads: config_dict["spades"]["threads"]
+	singularity: image
+	shell:
+		"""
+		spades.py \
+		-t {threads} \
+		-s {input} \
+		--rna \
+		-o TRANSCRIPT/spades \
+		-k 49,73,99
+		"""
+
+rule evigene:
+	input: "TRANSCRIPT/spades/hard_filtered_transcripts.fasta"
+	output: "TRANSCRIPT/spades/okayset/spades.okay.tr"
+	threads: config_dict["evigene"]["threads"]
+	singularity: image
+	shell:
+		"""
+		$evigene/evigene/scripts/rnaseq/trformat.pl -prefix=spades -output TRANSCRIPT/evigene/spades.tr -log -input {input}
+		$evigene/evigene/scripts/prot/tr2aacds.pl -tidy -NCPU {threads} -MAXMEM 50000 -log -cdna TRANSCRIPT/evigene/spades.tr
+		
+		mkdir -p TRANSCRIPT/spades/okayset
+		cp -rlf okayset/* TRANSCRIPT/spades/okayset
+		rm okayset/*
+		"""
+# TODO: install gffread to image
+rule pasaPrep:
+	input: "TRANSCRIPT/spades/okayset/spades.okay.tr"
+	output: "TRANSCRIPT/spades/okayset/spades.okay.tr.clean"
+	singularity: image
+	params:
+		genome = config_dict["Input"]["genome"]
+	shell:
+		"""
+		cp {params.genome} TRANSCRIPT/PASA/genome.fasta
+
+		minimap2 -ax splice \
+		--cs TRANSCRIPT/PASA/genome.fasta \
+		{input} \
+		-a \
+		-o TRANSCRIPT/PASA/evigene.sam
+
+		/opt/miniconda3/opt/pasa-2.5.2/misc_utilities/SAM_to_gff3.minimap2_path1only.pl \
+			TRANSCRIPT/PASA/evigene.sam > TRANSCRIPT/PASA/evigene.gff
+
+		gffread TRANSCRIPT/PASA/evigene.gff \
+			-T -F \
+			--keep-exon-attrs \
+			-o TRANSCRIPT/PASA/evigene.gtf
+		sed -i 's/\\ .*//g' {input}	
+		/opt/miniconda3/opt/pasa-2.5.2/bin/seqclean {input}
+		
+		mv spades.okay.tr.* TRANSCRIPT/spades/okayset/
+		
+		sed -i "s|DATABASE=.*|DATABASE=$(readlink -f TRANSCRIPT/PASA)/pasa.sqlite|" config/alignAssembly.config
+		sed -i "s|DATABASE=.*|DATABASE=$(readlink -f TRANSCRIPT/PASA)/pasa.sqlite|" config/annotCompare.config
+		"""
+
+#TODO: Will I need to move a bunch of files to the correct directory? Yes...
+rule pasa:
+	input: 
+		clean = "TRANSCRIPT/spades/okayset/spades.okay.tr.clean",
+		tr = "TRANSCRIPT/spades/okayset/spades.okay.tr"
+	output: "TRANSCRIPT/PASA/pasa.sqlite.pasa_assemblies.gff3"
+	threads: config_dict["pasa"]["threads"]
+	singularity: image
+	shell:
+		"""
+		rm __pasa_pasa.sqlite_SQLite_chkpts/*.ok || echo 'No pasa .ok files to remove... continuing'
+
+		export TMPDIR=./TMP
+		export SLURM_TMPDIR=./TMP
+
+		/opt/miniconda3/opt/pasa-2.5.2/Launch_PASA_pipeline.pl \
+		-c config/alignAssembly.config \
+		--trans_gtf TRANSCRIPT/PASA/evigene.gtf \
+		-C -r -R \
+		--ALIGNER gmap,minimap2 \
+		-g TRANSCRIPT/PASA/genome.fasta \
+		--MAX_INTRON_LENGTH 20000 \
+		--TRANSDECODER \
+		--ALT_SPLICE \
+		--CPU {threads} \
+		-t {input.clean} -T \
+		-u {input.tr}
+
+		cp pasa.sqlite.pasa_assemblies.gff3 TRANSCRIPT/PASA/pasa.sqlite.pasa_assemblies.gff3
+		"""
+
+rule addXS:
+	input: "GETA/HiSat2/hisat2.sorted.bam"
+	output: "TRANSCRIPT/HiSat/hisat2.sorted.rmdup.XS.bam"
+	singularity: image
+	params:
+		genome = config_dict["Input"]["genome"]
+	shell:
+		"""
+		samtools view -h {input} | \
+		addXS {params.genome} | \
+		samtools view -bS - > {output}
+		"""
+
+checkpoint prepPsiClass_Hisat:
+	input: "TRANSCRIPT/HiSat/hisat2.sorted.rmdup.XS.bam"
+	output: directory("OTHER/PsiClass/splitBam")
+	singularity: image
+	shell: """
+		mkdir -p {output}
+		python bin/splitBam.py {input} OTHER/PsiClass/splitBam
+	"""
+
+rule stringtie_HiSat:
+	input: "TRANSCRIPT/HiSat/hisat2.sorted.rmdup.XS.bam"
+	output: "OTHER/StringTie/stringtie.hisat2.gff"
+	singularity: image
+	threads: config_dict["stringtie_HiSat"]["threads"]
+	shell: """
+		stringtie {input} \
+			-o OTHER/StringTie/stringtie.hisat2.gtf \
+			-l stringtie \
+			-p {threads} \
+			-t \
+			-c 1.5 \
+			-f 0.05
+		gtf_to_alignment_gff3.pl OTHER/StringTie/stringtie.hisat2.gtf > {output}
+		sed -i 's/Cufflinks/StringTie/' {output}
+		"""
+
+rule bamToFastq:
+	input: "GETA/HiSat2/hisat2.sorted.bam"
+	output: 
+		one = "TRANSCRIPT/HiSat/hisat2.sorted.rmdup_R1.fastq.gz",
+		two = "TRANSCRIPT/HiSat/hisat2.sorted.rmdup_R2.fastq.gz",
+		single = "TRANSCRIPT/HiSat/hisat2.sorted.rmdup_singeltons.fastq.gz"
+	singularity: image
+	threads: config_dict["bamToFastq"]["threads"]
+	shell: """
+		samtools fastq \
+			-@ {threads} \
+			{input} \
+			-1 {output.one} \
+			-2 {output.two} \
+			-0 TRANSCRIPT/HiSat/hisat2.sorted.rmdup_other.fastq.gz \
+			-s {output.single} \
+			-n
+			"""
+
+rule STAR_generate:
+	output: "OTHER/STAR/SAindex"
+	threads: config_dict["STAR_generate"]["threads"]
+	singularity: image
+	params:
+		genome =  config_dict["Input"]["genome"]
+	shell: """
+			STAR  \
+			--runThreadN {threads} \
+			--runMode genomeGenerate \
+			--genomeDir OTHER/STAR/ \
+			--genomeFastaFiles {params.genome} \
+			--genomeSAindexNbases 12
+			"""
+
+rule STAR_paired:
+	input:
+		g  = "OTHER/STAR/SAindex",
+		one = "TRANSCRIPT/HiSat/hisat2.sorted.rmdup_R1.fastq.gz",
+		two = "TRANSCRIPT/HiSat/hisat2.sorted.rmdup_R2.fastq.gz",
+	output: "OTHER/STAR/hisat2.sorted.rmdup.STAR_pairedend.bamAligned.sortedByCoord.out.bam"
+	threads: config_dict["STAR_paired"]["threads"]
+	singularity: image
+	shell: """ 
+			STAR --runMode alignReads \
+  			--runThreadN {threads} \
+  			--outFilterMultimapNmax 100 \
+  			--alignIntronMin 25 \
+  			--alignIntronMax 10000 \
+  			--genomeDir OTHER/STAR \
+			--outSAMtype BAM SortedByCoordinate \
+			--limitBAMsortRAM 216000000000 \
+			--outBAMsortingBinsN 200 \
+			--outSAMattributes XS \
+			--outSAMstrandField intronMotif \
+			--outFileNamePrefix OTHER/STAR/hisat2.sorted.rmdup.STAR_pairedend.bam \
+			--readFilesCommand zcat \
+			-c \
+			--readFilesIn {input.one} {input.two}
+			"""
+
+rule STAR_single:
+	input:
+		single = "TRANSCRIPT/HiSat/hisat2.sorted.rmdup_singeltons.fastq.gz",
+		g  = "OTHER/STAR/SAindex"
+	output: "OTHER/STAR/hisat2.sorted.rmdup.STAR_singleend.bamAligned.sortedByCoord.out.bam"
+	threads: config_dict["STAR_single"]["threads"]
+	singularity: image
+	shell: """
+		STAR --runMode alignReads \
+		--runThreadN {threads} \
+		--outFilterMultimapNmax 100 \
+		--alignIntronMin 25 \
+		--alignIntronMax 10000 \
+		--genomeDir OTHER/STAR \
+		--outSAMtype BAM Unsorted \
+		--outSAMattributes XS \
+		--outSAMstrandField intronMotif \
+		--outFileNamePrefix OTHER/STAR/hisat2.rmdup.STAR_singleend.bam \
+		--readFilesCommand zcat \
+		-c \
+		--readFilesIn {input.single}
+
+		sambamba sort -p \
+		  --memory-limit=216G \
+		  --tmpdir=OTHER/STAR/sort_tmp \
+		  --nthreads={threads} \
+		  OTHER/STAR/hisat2.rmdup.STAR_singleend.bamAligned.out.bam \
+		  -o OTHER/STAR/hisat2.sorted.rmdup.STAR_singleend.bamAligned.sortedByCoord.out.bam
+		"""
+
+rule mergeSTAR:
+	input:
+		paired = "OTHER/STAR/hisat2.sorted.rmdup.STAR_pairedend.bamAligned.sortedByCoord.out.bam",
+		single = "OTHER/STAR/hisat2.sorted.rmdup.STAR_singleend.bamAligned.sortedByCoord.out.bam"
+	output: "OTHER/STAR/hisat2.sorted.rmdup.STAR_merge_XS.bam"
+	threads: config_dict["mergeSTAR"]["threads"]
+	params: genome = config_dict["Input"]["genome"]
+	singularity: image
+	shell: """
+		samtools merge -f {output} \
+			{input.paired} \
+			{input.single}
+		"""
+
+# PsiClass seems to have a multithreading bug in classes when subexon count gets large
+# Set threads to 1 for safety
+rule psiClass_STAR:
+	input:  "OTHER/STAR/hisat2.sorted.rmdup.STAR_merge_XS.bam"
+	output: "OTHER/PsiClass/psiclass.STAR_vote.gff"
+	threads: config_dict["psiClass_STAR"]["threads"]
+	singularity: image
+	shell: """
+			samtools view -bq 10 {input} > {input}.filtered.bam
+
+			psiclass -b {input}.filtered.bam \
+			-o OTHER/PsiClass/psiclass.STAR \
+			-p {threads} \
+			-c 0.05
+			
+			gtf_to_alignment_gff3.pl OTHER/PsiClass/psiclass.STAR_vote.gtf > {output}
+			sed -i 's/Cufflinks/PsiClass/' {output}
+
+			rm {input}.filtered.bam
+			"""
+
+rule stringtie_STAR:
+	input: "OTHER/STAR/hisat2.sorted.rmdup.STAR_merge_XS.bam"
+	output: "OTHER/StringTie/stringtie.STAR.gff"
+	threads: config_dict["stringtie_STAR"]["threads"]
+	singularity: image
+	shell: """
+			stringtie {input} \
+			-o OTHER/StringTie/stringtie.STAR.gtf \
+			-l stringtie \
+			-p {threads} \
+			-t \
+			-c 1.5 \
+			-f 0.05
+
+			gtf_to_alignment_gff3.pl OTHER/StringTie/stringtie.STAR.gtf > {output}
+			sed -i 's/Cufflinks/StringTie/' {output}
+			"""
+
+rule convertToEvmFormat:
+	input: 
+		gmap = f"TRANSCRIPT/Gmap/gmapExon.gff3",
+		liftoff = f"OTHER/LiftOff/{prefix}_liftoff.gff3",
+		genewise = "GETA/homolog/genewise.gff3",
+		genewise_prot = "GETA/homolog/genewise.gff",
+		miniprot = rules.miniprot.output.clean
+	output: 
+		genewise_prot = "EVM/genewise_protAln_evm.gff",
+		gmap = "EVM/gmap_exonAln_evm.gff",
+		genewise = "EVM/genewise_evm.gff3",
+		liftoff = "EVM/liftoff_evm.gff3",
+		miniprot = "EVM/miniprot_proteinAln_evm.gff"
+	singularity: image
+	params: pre = prefix
+	shell: """
+		bin/gff_to_evm.py \
+		GETA/homolog/genewise.gff \
+		--source GeneWise \
+		--type nucleotide_to_protein_match \
+		--feature match \
+		--genewise \
+		> EVM/genewise_protAln_evm.gff
+
+		bin/gff_to_evm.py \
+		TRANSCRIPT/Gmap/gmapExon.gff3 \
+		--source gmap.exon_match \
+		--type nucleotide_to_nucleotide_match \
+		--feature \\* \
+		> EVM/gmap_exonAln_evm.gff
+		
+		## Other - genewise
+		bin/gff_to_evm.py \
+		GETA/homolog/genewise.gff3 \
+		--feature '.*' \
+		--source Genewise \
+		--check-coords > EVM/genewise_evm.gff3
+		
+		## Other - Liftoff
+		bin/gff_to_evm.py \
+		OTHER/LiftOff/{params.pre}_liftoff.gff3 \
+		--feature '.*' \
+		> EVM/liftoff_evm.gff3
+
+		bin/gff_to_evm.py \
+		{input.miniprot} \
+		--source miniprot \
+		--type miniprot \
+		--feature CDS \
+		--miniprot \
+		> EVM/miniprot_proteinAln_evm.gff
+		"""
+
+rule combineEVMInputs:
+	input: 
+		st_hisat = "OTHER/StringTie/stringtie.hisat2.gff",
+		st_star = "OTHER/StringTie/stringtie.STAR.gff",
+		pc_star = "OTHER/PsiClass/psiclass.STAR_vote.gff",
+		genewise_other = "EVM/genewise_evm.gff3",
+		gmapExon = "EVM/gmap_exonAln_evm.gff",
+		pasa = "TRANSCRIPT/PASA/pasa.sqlite.pasa_assemblies.gff3",
+		genewise_prot = "EVM/genewise_protAln_evm.gff",
+		miniprot = rules.convertToEvmFormat.output.miniprot,
+		liftoff = "EVM/liftoff_evm.gff3",
+		augustus_gff3 = "GETA/Augustus/augustus.gff3",
+		geta_gff3 = f"GETA/{prefix}.geneModels.gff3",
+		helixer_gff3 = f"AB_INITIO/Helixer/{prefix}_helixer.gff3"
+	singularity: image
+	output:
+		"EVM/gene_predictions_checkCoords.gff3",
+		"EVM/transcript_alignments_checkCoords.gff3",
+		"EVM/protein_alignments_checkCoords.gff3"
+	# Other sources of evidence 
+	shell: """
+		cat {input.helixer_gff3} \
+			{input.augustus_gff3} \
+			{input.geta_gff3} \
+			{input.genewise_other} \
+			> EVM/gene_predictions.gff3
+	
+		bin/gff_to_evm.py EVM/gene_predictions.gff3 \
+		--check-coords \
+		--feature \\* > EVM/gene_predictions_checkCoords.gff3
+
+		# Transcript evidence
+		cat {input.gmapExon} \
+			{input.pasa} \
+			{input.liftoff} \
+			{input.st_hisat} \
+			{input.st_star} \
+			{input.pc_star} \
+			> EVM/transcript_alignments.gff3
+
+		bin/gff_to_evm.py EVM/transcript_alignments.gff3 \
+			--check-coords \
+			--feature \\* > EVM/transcript_alignments_checkCoords.gff3
+
+		# Protein evidence
+		cat {input.genewise_prot} \
+			{input.miniprot} \
+			> EVM/protein_alignments.gff3
+		
+		bin/gff_to_evm.py EVM/protein_alignments.gff3 \
+			--check-coords \
+			--feature \\* > EVM/protein_alignments_checkCoords.gff3
+			"""
+
+partitionEVM_Output = [f"EVM/commands.{evm_num}.list" for evm_num in range(num_evm_files)]
+
+#TODO: Run evm such that outputs are stored in separate directory with sensible output structure
+rule partitionEVM:
+	input:
+		"EVM/gene_predictions_checkCoords.gff3",
+		"EVM/transcript_alignments_checkCoords.gff3",
+		"EVM/protein_alignments_checkCoords.gff3"
+	output:
+		"EVM/partitions_list.out"
+	params:
+		genome = config_dict["Input"]["genome"]
+	singularity: image
+	shell: """
+			rm EVM/*.ok || echo 'No partition.ok files to remove...continuing'
+			rm EVM/*/*/*.ok || echo 'No chunk.ok files to remove...continuing'
+			rm EVM/*/*checkCoords.gff3 || echo 'No old evidence files to remove ...continuing'
+			
+			export TMPDIR=./TMP
+			export SLURM_TMPDIR=./TMP
+			
+			/usr/local/bin/EVidenceModeler-v2.1.0/EvmUtils/partition_EVM_inputs.pl \
+				--genome {params.genome} \
+				--gene_predictions EVM/gene_predictions_checkCoords.gff3 \
+				--protein_alignments EVM/protein_alignments_checkCoords.gff3 \
+				--transcript_alignments EVM/transcript_alignments_checkCoords.gff3 \
+				--segmentSize 1000000 \
+				--overlapSize 20000 \
+				--partition_dir EVM \
+				--partition_listing EVM/partitions_list.out
+			"""
+
+
+rule writeEVMCommands:
+	input: 
+		"EVM/gene_predictions_checkCoords.gff3",
+		"EVM/transcript_alignments_checkCoords.gff3",
+		"EVM/protein_alignments_checkCoords.gff3",
+		"EVM/partitions_list.out"
+	output:
+		partitionEVM_Output
+	singularity: image
+	params:
+		genome = config_dict["Input"]["genome"],
+		weight = config_dict["Input"]["evm_weights"],
+		split_evm = num_evm_files
+	shell: """
+			export TMPDIR=./TMP
+			export SLURM_TMPDIR=./TMP
+			/usr/local/bin/EVidenceModeler-v2.1.0/EvmUtils/write_EVM_commands.pl \
+			--genome {params.genome} \
+			--weights {params.weight} \
+			--gene_predictions EVM/gene_predictions_checkCoords.gff3 \
+			--protein_alignments EVM/protein_alignments_checkCoords.gff3 \
+			--transcript_alignments EVM/transcript_alignments_checkCoords.gff3 \
+			--output_file_name evm.out \
+			--partitions EVM/partitions_list.out > EVM/commands.list
+
+			./bin/splitEVMCommands.py {params.split_evm}
+			"""
+
+rule runEVM:
+	input: "EVM/commands.{evm_num}.list"
+	output: "EVM/ok/commands.{evm_num}.ok"
+	singularity: image
+	shell: """
+		bash EVM/commands.{wildcards.evm_num}.list
+		touch EVM/ok/commands.{wildcards.evm_num}.ok
+		"""
+
+runEVM_Output = [f"EVM/ok/commands.{evm_num}.ok" for evm_num in range(num_evm_files)]
+
+rule recombineEVM:
+	input: runEVM_Output
+	output: "EVM.all.gff3"
+	singularity: image
+	params: genome = config_dict["Input"]["genome"]
+	shell: """
+			export TMPDIR=./TMP
+			export SLURM_TMPDIR=./TMP
+
+			/usr/local/bin/EVidenceModeler-v2.1.0/EvmUtils/recombine_EVM_partial_outputs.pl \
+			--partitions EVM/partitions_list.out \
+			--output_file_name $(pwd)/EVM/evm.out
+			
+			/usr/local/bin/EVidenceModeler-v2.1.0/EvmUtils/convert_EVM_outputs_to_GFF3.pl \
+			--partitions EVM/partitions_list.out \
+			--output $(pwd)/EVM/evm.out \
+			--genome {params.genome}
+
+			find . -regex '.*\\/evm.out.gff3' -exec cat {{}} \\; > {output}
+		"""
+
+#################### Begin Mikado ########################
+rule portcullis:
+	input:
+		paired = "OTHER/STAR/hisat2.sorted.rmdup.STAR_pairedend.bamAligned.sortedByCoord.out.bam",
+		single = "OTHER/STAR/hisat2.sorted.rmdup.STAR_singleend.bamAligned.sortedByCoord.out.bam"
+	output: "portcullis_out/3-filt/portcullis_filtered.pass.junctions.bed"
+	threads: config_dict["portcullis"]["threads"]
+	params: 
+		genome = config_dict["Input"]["genome"],
+		s = image
+	shell:'''
+		singularity exec {params.s} \
+		conda run -n mikado \
+		portcullis full \
+		  -t {threads} \
+		  --force \
+		  --strandedness unstranded \
+		  {params.genome} \
+		  {input}
+		'''
+
+# TODO: dynamically download scoring file...plant.yaml hard-coded
+rule mikadoConfigure:
+	input:
+		pc_star = "OTHER/PsiClass/psiclass.STAR_vote.gff",
+		st_hisat = "OTHER/StringTie/stringtie.hisat2.gff",
+		st_star = "OTHER/StringTie/stringtie.STAR.gff",
+		pasa = "TRANSCRIPT/PASA/pasa.sqlite.pasa_assemblies.gff3",
+		augustus = "GETA/Augustus/augustus.gff3",
+		helixer = rules.helixer.output,
+		miniprot = rules.miniprot.output.clean,
+		genewise = "GETA/homolog/genewise.gff3",
+		geta = rules.GETA_output.output.bgm,
+		liftoff = rules.liftoff.output,
+		portcullis ="portcullis_out/3-filt/portcullis_filtered.pass.junctions.bed",
+		protein = rules.mergeProteins.output.m
+	output: "mikado/configuration.toml"
+	params: 
+		genome = genome,
+		s = image
+	shell:'''
+		if [ -f mikado/mikado_config.txt ]; then rm -f mikado/mikado_config.txt; fi
+		
+		echo "{input.pc_star}\tpc_star\tTrue" >> mikado/mikado_config.txt
+		echo "{input.st_hisat}\tst_hisat\tTrue" >> mikado/mikado_config.txt
+		echo "{input.st_star}\tst_star\tTrue" >> mikado/mikado_config.txt
+		echo "{input.pasa}\tpasa\tTrue" >> mikado/mikado_config.txt
+		echo "{input.augustus}\taugustus\tTrue" >> mikado/mikado_config.txt
+		echo "{input.helixer}\thelixer\tTrue" >> mikado/mikado_config.txt
+		echo "{input.miniprot}\tminiprot\tTrue" >> mikado/mikado_config.txt
+		echo "{input.genewise}\tgenewise\tTrue" >> mikado/mikado_config.txt
+		echo "{input.geta}\tgeta\tTrue" >> mikado/mikado_config.txt
+		echo "{input.liftoff}\tliftoff\tTrue" >> mikado/mikado_config.txt
+		
+		singularity exec {params.s} \
+		conda run -n mikado \
+		mikado configure \
+		  --list mikado/mikado_config.txt \
+		  --reference {params.genome} \
+		  --mode stringent \
+		  --scoring config/plant.yaml \
+		  --junctions {input.portcullis} \
+		  -bt {input.protein} \
+		  --out-dir mikado > mikado/configuration.toml
+
+		singularity exec {params.s} \
+		samtools faidx {params.genome} -o mikado/genome.fasta.fai
+		'''
+
+rule mikadoPrepare:
+	input: rules.mikadoConfigure.output
+	output: "mikado/mikado_prepared.fasta"
+	params: s = image
+	shell:'''
+		singularity exec {params.s} \
+		conda run -n mikado \
+		mikado prepare \
+		--json-conf {input}
+		'''
+
+rule mikadoMakeDB:
+	input: rules.mergeProteins.output.m
+	output: "mikado/mikado.dmnd" 
+	singularity: image
+	shell:'''
+		diamond makedb --db mikado/mikado --in {input}
+		'''
+
+rule mikadoBlastX:
+	input: 
+		db = rules.mikadoMakeDB.output,
+		transcripts = rules.mikadoPrepare.output
+	output: "mikado/mikado.blast.xml.gz"
+	params: args = config_dict["Internal"]["diamond"]
+	threads: config_dict["mikadoBlastX"]["threads"]
+	singularity: image
+	shell:"""
+		diamond \
+		  blastx \
+		  {params.args} \
+		  --outfmt 5 \
+		  --db "mikado/mikado" \
+		  --query {input.transcripts} \
+		  --out mikado/mikado.blast.xml \
+		  --threads {threads}
+		
+		gzip mikado/mikado.blast.xml
+		"""
+
+rule mikadoTransdecoder_LongOrfs:
+	input: rules.mikadoPrepare.output
+	output: "mikado/longest_orfs.cds"
+	threads: config_dict["mikadoTransdecoder_LongOrfs"]["threads"]
+	singularity: image
+	shell:"""
+		if [ -d mikado.__checkpoints_longorfs ]; then
+		  if [ -z "$(ls -A mikado.__checkpoints_longorfs)" ]; then 
+		    echo "No checkpoints...continuing"; 
+		  else 
+		    rm mikado.__checkpoints_longorfs/*;
+		  fi
+		fi
+
+		TransDecoder.LongOrfs \
+		  -t {input} \
+		  --output_dir mikado
+		"""
+
+rule mikadoTransdecoder_Predict:
+	input: 
+		prep = rules.mikadoPrepare.output,
+		longorf = "mikado/longest_orfs.cds"
+	output: "mikado/mikado_prepared.fasta.transdecoder.bed"
+	threads: config_dict["mikadoTransdecoder_Predict"]["threads"]
+	params: args = config_dict["Internal"]["TransDecoder.Predict"]
+	singularity: image
+	shell:"""
+		if [ -d mikado.__checkpoints ]; then
+		  if [ -z "$(ls -A mikado.__checkpoints)" ]; then
+		    echo "No checkpoints...continuing";
+		  else
+		    rm mikado.__checkpoints/*;
+		  fi
+		fi
+
+		TransDecoder.Predict {params.args} \
+		  -t {input.prep} \
+		  --output_dir mikado
+
+		mv mikado_prepared.fasta.transdecoder* mikado/
+		"""
+
+rule mikadoSerialise:
+	input:
+		config = rules.mikadoConfigure.output,
+		blast = rules.mikadoBlastX.output,
+		orfs = rules.mikadoTransdecoder_Predict.output,
+		prep = rules.mikadoPrepare.output,
+		junc = rules.portcullis.output,
+		prots = rules.mergeProteins.output.m
+	output: "mikado/mikado.db"
+	params: 
+		s = image,
+		g = genome
+	shell:"""
+		singularity exec {params.s} \
+		samtools faidx mikado/mikado_prepared.fasta
+
+		singularity exec {params.s} \
+		samtools faidx {input.prots}
+
+		singularity exec {params.s} \
+		conda run -n mikado \
+		  mikado serialise \
+		  --json-conf {input.config} \
+		  --transcripts {input.prep} \
+		  --xml {input.blast} \
+		  --orfs {input.orfs} \
+		  --junctions {input.junc} \
+		  --genome {params.g} \
+		  --genome_fai mikado/genome.fasta.fai \
+		  --force \
+		  {output}
+		"""
+
+rule mikadoPick:
+	input: 
+		db = rules.mikadoSerialise.output,
+		config = rules.mikadoConfigure.output
+	output: "mikado/mikado.loci.gff3"
+	params: s = image
+	shell:"""
+		singularity exec {params.s} \
+		conda run -n mikado \
+		mikado pick \
+		--json-conf {input.config} \
+		--subloci-out mikado.subloci.gff3 \
+		--monoloci-out mikado.monoloci.gff3 \
+		--loci-out mikado.loci.gff3 \
+		--output-dir mikado
+		"""
+
+#################### End Mikado ########################
+
+rule agat_clean:
+	input:
+		mikado = rules.mikadoPick.output,
+		geta = rules.GETA_output.output.gm,
+		evm = rules.recombineEVM.output,
+		helixer = rules.helixer.output
+	output: 
+		mikado = "mikado_clean.gff3",
+		geta = "geta_clean.gff3",
+		evm = "evm_clean.gff3",
+		helixer = "helixer_clean.gff3"
+	singularity: image
+	shell: """
+		agat_convert_sp_gxf2gxf.pl -gff {input.mikado} -o {output.mikado}
+		agat_convert_sp_gxf2gxf.pl -gff {input.geta} -o {output.geta}
+		agat_convert_sp_gxf2gxf.pl -gff {input.evm} -o {output.evm}
+		agat_convert_sp_gxf2gxf.pl -gff {input.helixer} -o {output.helixer}
+	"""
+
+rule EvidentialCombine:
+	input: 
+		miniprot = rules.miniprot.output.clean,
+		star = rules.mergeSTAR.output,
+		helixer = rules.agat_clean.output.helixer,
+		geta = rules.agat_clean.output.geta,
+		mikado = rules.agat_clean.output.mikado,
+		evm = rules.agat_clean.output.evm
+	output: "complete_primary_draft.gff3"
+	params: 
+		g = genome,
+		s = image
+	shell: """
+		singularity exec {params.s} \
+		conda run -n mikado \
+		python bin/CombineDuck.py \
+		  --gff_files {input.evm}:EVM {input.geta}:GETA {input.helixer}:Helixer {input.mikado}:Mikado \
+		  --bam_files {input.star}:star \
+		  --prot_files {input.miniprot}:miniprot \
+		  --genome_fasta {params.g} \
+		  --output complete_primary_draft.gff3
+		"""	
+
+
+#TODO: Use snakemake 'ensure' to more robustly check for proper output
+rule pasaPost:
+	input: 
+		"complete_primary_draft.gff3",
+		"TRANSCRIPT/spades/okayset/spades.okay.tr.clean"
+	output: "pasaPost.ok"
+	threads: config_dict["pasaPost"]["threads"]
+	singularity: image
+	shell: """
+			export TMPDIR=./TMP
+			export SLURM_TMPDIR=./TMP
+			/opt/miniconda3/opt/pasa-2.5.2/scripts/Load_Current_Gene_Annotations.dbi \
+			-c config/alignAssembly.config \
+			-g TRANSCRIPT/PASA/genome.fasta \
+			-P complete_primary_draft.gff3
+		
+			/opt/miniconda3/opt/pasa-2.5.2/Launch_PASA_pipeline.pl \
+			-c config/annotCompare.config \
+			--CPU {threads} \
+			-A \
+			-g TRANSCRIPT/PASA/genome.fasta \
+			-t TRANSCRIPT/spades/okayset/spades.okay.tr.clean
+			
+			touch pasaPost.ok
+			"""
+
+rule agat_clean_final:
+	input: "pasaPost.ok"
+	output: "complete_draft.gff3"
+	singularity: image
+	shell: """
+		export pasa=$(ls -t pasa.sqlite.gene_structures_post_PASA_updates.*.gff3 | head -n 1)
+		agat_convert_sp_gxf2gxf.pl -gff ${{pasa}} -o complete_draft.gff3
+		"""
+#TODO: Can I add the filter snakemake in a modular fashion?
+# https://snakemake.readthedocs.io/en/stable/snakefiles/modularization.html#modules
