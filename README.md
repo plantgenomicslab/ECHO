@@ -15,7 +15,7 @@ After running the pipline, use ```bin/TidyGFF.py``` to ready your GFF for public
 The quickest way to obtain ECHO is to download the singularity image, clone the repo, and install Snakemake with conda.
 ```bash
 # Download the singularity image.
-wget ...
+singularity pull library://plantgenomicslab/echo/echo:latest
 
 # Download the repo
 git clone git@github.com:plantgenomicslab/ECHO.git
