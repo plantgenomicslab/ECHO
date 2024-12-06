@@ -2235,13 +2235,8 @@ rule pasaPrep:
 		-a \
 		-o TRANSCRIPT/PASA/evigene.sam
 
-		/opt/miniconda3/opt/pasa-2.5.2/misc_utilities/SAM_to_gff3.minimap2_path1only.pl \
-			TRANSCRIPT/PASA/evigene.sam > TRANSCRIPT/PASA/evigene.gff
+		/opt/miniconda3/opt/pasa-2.5.2/misc_utilities/SAM_to_gtf.pl TRANSCRIPT/PASA/evigene.sam > TRANSCRIPT/PASA/evigene.gtf
 
-		gffread TRANSCRIPT/PASA/evigene.gff \
-			-T -F \
-			--keep-exon-attrs \
-			-o TRANSCRIPT/PASA/evigene.gtf
 		sed -i 's/\\ .*//g' {input.spades}	
 		
 		/opt/miniconda3/opt/pasa-2.5.2/misc_utilities/gff3_file_to_proteins.pl \
@@ -2268,6 +2263,10 @@ rule pasa:
 	shell:
 		"""
 		rm __pasa_pasa.sqlite_SQLite_chkpts/*.ok || echo 'No pasa .ok files to remove... continuing'
+		rm __all_transcripts.fasta.transdecoder_dir/*/*.ok || echo 'No pasa transdecoder .ok files to remove...continuing'
+		rm  __all_transcripts.fasta.transdecoder_dir.__checkpoints/*.ok || echo 'No checkpoints'
+		rm __all_transcripts.fasta.transdecoder_dir.__checkpoints_longorfs/*.ok || echo 'No longorfs'
+		rm minimap2.splice_alignments.gff3.ok spades.okay.tr.clean.mm2.bam.ok transcripts_for_pasa.fasta.clean.mm2.bam.ok || echo 'No files to remove'
 
 		export TMPDIR=./TMP
 		export SLURM_TMPDIR=./TMP
