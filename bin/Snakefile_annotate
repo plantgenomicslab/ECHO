@@ -193,8 +193,7 @@ def allInput(wildcards):
 		"PROTEIN/merged_rmdup_proteins.fasta.miniprot.gff3",
 		"EVM/miniprot_proteinAln_evm.gff",
 		"complete_draft.gff3",
-		"GETA/homolog/genewise.gff",
-		"GETA/homolog/homolog_protein.split/homolog.part_001.out"
+		"GETA/homolog/genewise.gff"
 		]
 
 	if config_dict["Input"]["geta"]["RM_lib"] == "None":
