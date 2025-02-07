@@ -1,9 +1,9 @@
-# ECHO Genome Annotation
+# Sylvan Genome Annotation
 
-ECHO computes comprehensive genome annotations by combining and filtering the results of EVM/PASA, GETA, Mikado, and Helixer. 
-ECHO is designed to run via the SLURM job scheduler on a cloud or other high-performance computing system.
+Sylvan computes comprehensive genome annotations by combining and filtering the results of EVM/PASA, GETA, Mikado, and Helixer. 
+Sylvan is designed to run via the SLURM job scheduler on a cloud or other high-performance computing system.
 
-ECHO runs in two phases, the annotation phase and the filtering phase. 
+Sylvan runs in two phases, the annotation phase and the filtering phase. 
 The annotation phase processes all the provided sources of evidence (RNAseq, protein databases, neighbor species, and *ab initio* preditcions), computes multiple draft genome annotations, and merges them into a single draft. 
 The filtering phase uses a semi-supervised random forest algorithm to remove spurious gene models.
 
@@ -12,14 +12,14 @@ After running the pipline, use ```bin/TidyGFF.py``` to ready your GFF for public
 
 ## Installation and environment
 ---------------
-The quickest way to obtain ECHO is to download the singularity image, clone the repo, and install Snakemake with conda.
+The quickest way to obtain Sylvan is to download the singularity image, clone the repo, and install Snakemake with conda.
 ```bash
 # Download the singularity image.
-singularity pull library://plantgenomicslab/echo/echo:latest
+singularity pull library://plantgenomicslab/Sylvan/Sylvan:latest
 
 # Download the repo
-git clone git@github.com:plantgenomicslab/ECHO.git
-cd ECHO
+git clone git@github.com:plantgenomicslab/Sylvan.git
+cd Sylvan
 
 # Create an environment with Snakemake version 7
 conda create -n snake -c bioconda -c conda-forge \
@@ -31,11 +31,11 @@ conda activate snake
 If you have root permission and you prefer to build the singularity image from source:
 ```bash
 # Build the singularity image
-cd ECHO/singularity
+cd Sylvan/singularity
 
 sudo singularity build \
-  --bind ~/ECHO/singularity/.bashrc:/.bashrc \
-  echo.sif echo.def
+  --bind ~/Sylvan/singularity/.bashrc:/.bashrc \
+  Sylvan.sif Sylvan.def
 ```
 
 ## Preparing for a run
@@ -61,7 +61,7 @@ wget https://github.com/repeatexplorer/rexdb/blob/main/Viridiplantae_v4.0.fasta
 
 We use EDTA to construct a repeat sequence annotation for the genome. For EDTA, obtain cds sequences for the neighbor species you will use in the analysis. Then it can be run via the singularity image:
 ```
-singularity exec [echo.sif] EDTA.pl \
+singularity exec [Sylvan.sif] EDTA.pl \
 	--genome [genome.fasta] \
 	--cds [neighbors.cds] \
 	--anno 1 \
@@ -69,7 +69,7 @@ singularity exec [echo.sif] EDTA.pl \
 ```
 
 ### Configure the annotation and filter phases
-Both the annotation and filtering phases are managed by YAML control files (see ```config``` folder for examples). Customize the control files by first copy them from ```config``` to the ```ECHO``` folder:
+Both the annotation and filtering phases are managed by YAML control files (see ```config``` folder for examples). Customize the control files by first copy them from ```config``` to the ```Sylvan``` folder:
 ```bash
 cp config/config_annotate.yml config/config_filter.yml .
 ```
@@ -114,13 +114,13 @@ sbatch -A [account] \
     --wrap="bin/filter.sh"
 ```
 
-The final output of the filter is ```ECHO/FILTER/filter.gff3```.
+The final output of the filter is ```Sylvan/FILTER/filter.gff3```.
 
 ### Tuning the filter
 After the filtration script has completed, the results may be fine-tuned by adjusting the parameters of the random forest. 
 To adjust hyperparameters, rerun the python script outside of Snakemake:
 ```
-singularity exec [echo.sif] python bin/Filter.py --help
+singularity exec [Sylvan.sif] python bin/Filter.py --help
 ``` 
 
 ### Logs and troubleshooting 
@@ -129,12 +129,12 @@ Given variations in input data size, the program may terminate prematurely due t
 ```
 grep Error [annotation.err|filter.err]
 ```
-Log files for each rule are stored in ```ECHO/logs```. Look in ```ECHO/logs/[rule].err``` and/or ```ECHO/logs/[rule].out``` for potential memory issues. If a rule is crashing due to memory constraints, the memory can be adjusted in the  ```Cluster Configuration``` section of each configuration file.
+Log files for each rule are stored in ```Sylvan/logs```. Look in ```Sylvan/logs/[rule].err``` and/or ```Sylvan/logs/[rule].out``` for potential memory issues. If a rule is crashing due to memory constraints, the memory can be adjusted in the  ```Cluster Configuration``` section of each configuration file.
 
 ## Formatting output with TidyGFF
 
 ```
-singularity exec [echo.sif] python bin/TidyGFF.py \
+singularity exec [Sylvan.sif] python bin/TidyGFF.py \
     [pre], \
     [gff], \
     --out [output_name] \
